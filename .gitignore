@@ -9,6 +9,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.env
+.env.local
 *.egg-info/
 .eggs/
 dist/

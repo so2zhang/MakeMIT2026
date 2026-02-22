@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vultr Live Performance Dashboard</title>
+  <style>
+    :root { --bg:#0b1020; --panel:#121a30; --line:#2f3f64; --text:#e8efff; --sub:#9db1da; --acc:#4de3a0; --warn:#ffc857; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; color:var(--text); background: radial-gradient(1200px 700px at 20% -10%, #18305f, var(--bg)); }
+    .wrap { max-width: 1100px; margin: 24px auto; padding: 0 18px; }
+    .title { font-size: 34px; font-weight: 800; letter-spacing: .3px; margin-bottom: 6px; }
+    .sub { color: var(--sub); margin-bottom: 18px; }
+    .cards { display:grid; grid-template-columns: repeat(3,minmax(160px,1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { background: linear-gradient(180deg,#152245,#101a33); border:1px solid var(--line); border-radius: 12px; padding: 12px; }
+    .k { color: var(--sub); font-size:12px; text-transform: uppercase; letter-spacing: .08em;}
+    .v { font-size: 24px; font-weight: 700; margin-top: 6px; }
+    table { width:100%; border-collapse: collapse; background: var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid #233258; text-align:left; font-size: 13px; }
+    th { color:var(--sub); font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .08em;}
+    tr:last-child td { border-bottom: none; }
+    .pill { border:1px solid #2e466f; padding:2px 8px; border-radius: 999px; font-size:11px; }
+    .active { color:var(--acc); border-color:#2c745a; }
+    .stopped { color:var(--warn); border-color:#796130; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="title">Vultr Live Performance Dashboard</div>
+    <div class="sub">Realtime session ingest + fingerprint verification backend</div>
+
+    <div class="cards">
+      <div class="card"><div class="k">Backend Health</div><div class="v" id="health">-</div></div>
+      <div class="card"><div class="k">Recent Sessions</div><div class="v" id="count">-</div></div>
+      <div class="card"><div class="k">Latest Fingerprint</div><div class="v" id="fp" style="font-size:14px">-</div></div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Session</th>
+          <th>Performer</th>
+          <th>Status</th>
+          <th>Events</th>
+          <th>Started</th>
+          <th>Ended</th>
+          <th>Fingerprint</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <script>
+    async function refresh() {
+      const health = await fetch('/health').then(r=>r.json()).catch(()=>({ok:false}));
+      document.getElementById('health').textContent = health.ok ? 'OK' : 'DOWN';
+
+      const data = await fetch('/api/sessions/recent').then(r=>r.json()).catch(()=>({sessions:[]}));
+      const sessions = data.sessions || [];
+      document.getElementById('count').textContent = String(sessions.length);
+      document.getElementById('fp').textContent = sessions[0]?.fingerprint || '-';
+
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = '';
+      for (const s of sessions) {
+        const tr = document.createElement('tr');
+        const statusClass = (s.status || '').toLowerCase() === 'active' ? 'active' : 'stopped';
+        tr.innerHTML = `
+          <td><code>${s.id}</code></td>
+          <td>${s.performer_id}</td>
+          <td><span class="pill ${statusClass}">${s.status}</span></td>
+          <td>${s.event_count ?? 0}</td>
+          <td>${s.started_at || ''}</td>
+          <td>${s.ended_at || ''}</td>
+          <td><code>${s.fingerprint || ''}</code></td>
+        `;
+        tbody.appendChild(tr);
+      }
+    }
+    refresh();
+    setInterval(refresh, 2500);
+  </script>
+</body>
+</html>

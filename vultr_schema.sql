@@ -1,0 +1,33 @@
+CREATE TABLE IF NOT EXISTS sessions (
+  id UUID PRIMARY KEY,
+  performer_id TEXT NOT NULL DEFAULT 'anonymous',
+  started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  ended_at TIMESTAMPTZ,
+  status TEXT NOT NULL DEFAULT 'active',
+  event_count INTEGER NOT NULL DEFAULT 0,
+  fingerprint TEXT
+);
+
+CREATE TABLE IF NOT EXISTS events (
+  id BIGSERIAL PRIMARY KEY,
+  session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+  ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  pointer DOUBLE PRECISION,
+  middle DOUBLE PRECISION,
+  ring DOUBLE PRECISION,
+  pinky DOUBLE PRECISION,
+  fsr INTEGER,
+  hall1 INTEGER,
+  hall2 INTEGER,
+  hall3 INTEGER,
+  ax DOUBLE PRECISION,
+  ay DOUBLE PRECISION,
+  az DOUBLE PRECISION,
+  gx DOUBLE PRECISION,
+  gy DOUBLE PRECISION,
+  gz DOUBLE PRECISION,
+  payload JSONB NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_session_ts ON events(session_id, ts);
+CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
