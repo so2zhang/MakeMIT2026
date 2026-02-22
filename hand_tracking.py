@@ -5,45 +5,26 @@ import numpy as np
 import urllib.request
 import os
 import mido
+import random
 
 # --- MIDI SETUP ---
 midi_out = mido.open_output("GestureHand MIDI", virtual=True)
 
-FINGER_CC = {
-    "thumb": 20,
-    "index": 21,
-    "middle": 22,
-    "ring": 23,
-    "pinky": 24,
+# --- Notes for Cmaj9 chord ---
+CMAJ9_NOTES = [60, 64, 67, 71, 74]  # C4, E4, G4, B4, D5
+
+# Track which note is currently on per finger
+notes_on = {finger: None for finger in ["thumb", "index", "middle", "ring", "pinky"]}
+
+# Bend threshold to trigger note
+BEND_THRESHOLD = 0.5
+
+# --- Hand position CCs ---
+HAND_CC = {
+    "x": 25,  # horizontal hand position
+    "y": 26,  # vertical hand position
 }
-
-def enhance_red_gloves(frame):
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Red color ranges (two ranges because HSV wraps)
-    lower_red1 = np.array([0, 120, 70])
-    upper_red1 = np.array([10, 255, 255])
-
-    lower_red2 = np.array([170, 120, 70])
-    upper_red2 = np.array([180, 255, 255])
-
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-
-    mask = mask1 | mask2
-
-    # Clean up mask
-    mask = cv2.GaussianBlur(mask, (5, 5), 0)
-
-    # Apply mask to highlight red regions
-    enhanced = cv2.bitwise_and(frame, frame, mask=mask)
-
-    # Blend with original (keeps structure)
-    combined = cv2.addWeighted(frame, 0.7, enhanced, 0.6, 0)
-
-    return combined, mask
-
-last_cc_values = {f: -1 for f in FINGER_CC}
+last_hand_cc = {"x": -1, "y": -1}
 
 # --- FINGER BEND DETECTION ---
 def estimate_bend(landmarks, mcp, pip, dip, tip):
@@ -64,6 +45,12 @@ def get_finger_bends(landmarks):
         "ring":   estimate_bend(landmarks, 13, 14, 15, 16),
         "pinky":  estimate_bend(landmarks, 17, 18, 19, 20),
     }
+
+# --- HAND POSITION DETECTION ---
+def get_hand_position(landmarks):
+    xs = [lm.x for lm in landmarks]
+    ys = [lm.y for lm in landmarks]
+    return np.mean(xs), np.mean(ys)
 
 # --- MEDIAPIPE SETUP ---
 if not os.path.exists("hand_landmarker.task"):
@@ -108,26 +95,52 @@ with HandLandmarker.create_from_options(options) as landmarker:
                     cx, cy = int(lm.x * w), int(lm.y * h)
                     cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
 
+                # --- Hand position for octave scaling ---
+                hand_x, hand_y = get_hand_position(hand_landmarks)
+                octave_offset = int(hand_y * 2) * 12  # 0–2 octaves
+
+                # --- Finger note triggering ---
                 bends = get_finger_bends(hand_landmarks)
-
-                # --- SEND MIDI CC ---
                 for finger, bend in bends.items():
-                    cc_val = int(np.clip(bend * 127, 0, 127))
-                    cc_num = FINGER_CC[finger]
-
-                    if abs(cc_val - last_cc_values[finger]) > 1:
-                        msg = mido.Message('control_change', control=cc_num, value=cc_val)
+                    # Finger bent past threshold → trigger a random note if none is active
+                    if bend > BEND_THRESHOLD and notes_on[finger] is None:
+                        note = random.choice(CMAJ9_NOTES) + octave_offset
+                        velocity = random.randint(80, 127)
+                        msg = mido.Message('note_on', note=note, velocity=velocity)
                         midi_out.send(msg)
-                        last_cc_values[finger] = cc_val
+                        notes_on[finger] = note
+
+                    # Finger straightened → release the note if one is active
+                    elif bend <= BEND_THRESHOLD and notes_on[finger] is not None:
+                        msg = mido.Message('note_off', note=notes_on[finger], velocity=0)
+                        midi_out.send(msg)
+                        notes_on[finger] = None
+
+                # --- Hand position MIDI CCs ---
+                cc_x = int(np.clip(hand_x * 127, 0, 127))
+                cc_y = int(np.clip((1 - hand_y) * 127, 0, 127))
+                if abs(cc_x - last_hand_cc["x"]) > 1:
+                    msg = mido.Message('control_change', control=HAND_CC["x"], value=cc_x)
+                    midi_out.send(msg)
+                    last_hand_cc["x"] = cc_x
+                if abs(cc_y - last_hand_cc["y"]) > 1:
+                    msg = mido.Message('control_change', control=HAND_CC["y"], value=cc_y)
+                    midi_out.send(msg)
+                    last_hand_cc["y"] = cc_y
 
                 # --- DISPLAY ---
                 y = 30
                 for fname, bend in bends.items():
-                    cc_val = int(bend * 127)
-                    text = f"{fname}: {bend:.2f} ({cc_val})"
+                    text = f"{fname}: {bend:.2f}"
                     cv2.putText(frame, text, (10, y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
                     y += 25
+
+                cv2.putText(frame, f"Hand X: {cc_x}", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                y += 25
+                cv2.putText(frame, f"Hand Y: {cc_y}", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         else:
             cv2.putText(frame, "No hand detected", (10, 30),
