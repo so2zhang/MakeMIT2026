@@ -7,11 +7,13 @@ const int middlePin  = 33;
 const int ringPin    = 34;
 const int pinkyPin   = 35;
 
-// Capacitive touch pin
-const int thumbTouchPin = 15;
+// FSR analog pin (user mapping)
+const int fsrPin = 13;
 
-// Hall sensor pin (digital Hall module output)
-const int hallPin = 27;
+// Hall sensor pins (digital Hall module outputs)
+const int hallPin1 = 26;
+const int hallPin2 = 27;
+const int hallPin3 = 25;
 
 // MPU-6050
 const uint8_t MPU_ADDR = 0x68;
@@ -20,6 +22,8 @@ const float GYRO_SCALE  = 1.0f / 131.0f;        // deg/s per LSB at +-250 dps
 
 BluetoothSerial SerialBT;
 volatile bool btConnected = false;
+float fsrFiltered = 0.0f;
+const float FSR_ALPHA = 0.20f;  // Higher = more responsive, lower = smoother.
 
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
   (void)param;
@@ -95,7 +99,10 @@ bool mpuRead(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
 void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
-  pinMode(hallPin, INPUT_PULLUP);
+  pinMode(fsrPin, INPUT);
+  pinMode(hallPin1, INPUT_PULLUP);
+  pinMode(hallPin2, INPUT_PULLUP);
+  pinMode(hallPin3, INPUT_PULLUP);
 
   Wire.begin(21, 22);
   Wire.setClock(400000);
@@ -105,7 +112,7 @@ void setup() {
 
   Serial.println("ESP32 Glove + IMU Started");
   Serial.println("Bluetooth name: ESP32_GLOVE");
-  Serial.println("Format: GLOVE,p,m,r,pk,thumb,hall,ax,ay,az,gx,gy,gz");
+  Serial.println("Format: GLOVE,p,m,r,pk,thumb(here=fsr),hall1,hall2,hall3,ax,ay,az,gx,gy,gz");
 
   while (!mpuInit()) {
     Serial.println("MPU6050 not found, retrying...");
@@ -115,13 +122,22 @@ void setup() {
 }
 
 void loop() {
-  // Flex + touch + hall
+  // Flex + FSR + halls
   const int pointerValue = analogRead(pointerPin);
   const int middleValue  = analogRead(middlePin);
   const int ringValue    = analogRead(ringPin);
   const int pinkyValue   = analogRead(pinkyPin);
-  const int thumbTouchValue = touchRead(thumbTouchPin);
-  const int hallValue = (digitalRead(hallPin) == LOW) ? 1 : 0;
+  const int fsrRaw = analogRead(fsrPin);
+  const int hallValue1 = (digitalRead(hallPin1) == LOW) ? 1 : 0;
+  const int hallValue2 = (digitalRead(hallPin2) == LOW) ? 1 : 0;
+  const int hallValue3 = (digitalRead(hallPin3) == LOW) ? 1 : 0;
+
+  if (fsrFiltered == 0.0f) {
+    fsrFiltered = (float)fsrRaw;
+  } else {
+    fsrFiltered = (1.0f - FSR_ALPHA) * fsrFiltered + FSR_ALPHA * (float)fsrRaw;
+  }
+  const int thumbTouchValue = (int)(fsrFiltered + 0.5f);  // Kept name for Python compatibility.
 
   const float pointerVoltage = pointerValue * (3.3f / 4095.0f);
   const float middleVoltage  = middleValue  * (3.3f / 4095.0f);
@@ -130,22 +146,32 @@ void loop() {
 
   // IMU
   float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
-  mpuRead(ax, ay, az, gx, gy, gz);
+  mpuRead(ax, ay, az, gx, gy, gz); 
 
+  // Send packet over Bluetooth
   char buf[196];
   snprintf(
     buf,
     sizeof(buf),
-    "GLOVE,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+    "GLOVE,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
     pointerVoltage,
     middleVoltage,
     ringVoltage,
     pinkyVoltage,
     thumbTouchValue,
-    hallValue,
+    hallValue1,
+    hallValue2,
+    hallValue3,
     ax, ay, az, gx, gy, gz
   );
 
   sendLine(buf);
+
+  // Serial.print(thumbTouchValue,fsrRaw);
+  //   Serial.println(hallValue);
+  // delay(20);  // ~50 Hz
+//   char buf[64];
+// snprintf(buf, sizeof(buf), "%d,%d\n", thumbTouchValue, fsrRaw);
+// Serial.print(buf);
   delay(20);  // ~50 Hz
 }

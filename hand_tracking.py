@@ -54,6 +54,11 @@ GLOVE_IMU_CSV_RE = re.compile(
     r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),"
     r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+)\s*$"
 )
+GLOVE_IMU_HALL3_CSV_RE = re.compile(
+    r"^GLOVE,([0-9]*\.?[0-9]+),([0-9]*\.?[0-9]+),([0-9]*\.?[0-9]+),([0-9]*\.?[0-9]+),(\d+),([01]),([01]),([01]),"
+    r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),"
+    r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+)\s*$"
+)
 LEGACY_FINGER_RE = re.compile(
     r"^(Pointer|Middle|Ring|Pinky) Finger:\s*([0-9]*\.?[0-9]+)\s*V$", re.IGNORECASE
 )
@@ -203,6 +208,9 @@ class FlexReader(threading.Thread):
             "pinky": 0.0,
             "thumb": None,
             "hall": 0,
+            "hall1": 0,
+            "hall2": 0,
+            "hall3": 0,
             "ax": 0.0,
             "ay": 0.0,
             "az": 0.0,
@@ -230,6 +238,31 @@ class FlexReader(threading.Thread):
                         if not line:
                             continue
 
+                        gh3 = GLOVE_IMU_HALL3_CSV_RE.match(line)
+                        if gh3:
+                            p, m2, r, pk, t, h1, h2, h3, ax, ay, az, gx, gy, gz = gh3.groups()
+                            h1i = int(h1)
+                            h2i = int(h2)
+                            h3i = int(h3)
+                            with self.lock:
+                                self.values["pointer"] = float(p)
+                                self.values["middle"] = float(m2)
+                                self.values["ring"] = float(r)
+                                self.values["pinky"] = float(pk)
+                                self.values["thumb"] = int(t)
+                                self.values["hall1"] = h1i
+                                self.values["hall2"] = h2i
+                                self.values["hall3"] = h3i
+                                self.values["hall"] = 1 if (h1i or h2i or h3i) else 0
+                                self.values["ax"] = float(ax)
+                                self.values["ay"] = float(ay)
+                                self.values["az"] = float(az)
+                                self.values["gx"] = float(gx)
+                                self.values["gy"] = float(gy)
+                                self.values["gz"] = float(gz)
+                                self.last_update = time.time()
+                            continue
+
                         gi = GLOVE_IMU_CSV_RE.match(line)
                         if gi:
                             p, m2, r, pk, t, h, ax, ay, az, gx, gy, gz = gi.groups()
@@ -240,6 +273,9 @@ class FlexReader(threading.Thread):
                                 self.values["pinky"] = float(pk)
                                 self.values["thumb"] = int(t)
                                 self.values["hall"] = int(h)
+                                self.values["hall1"] = int(h)
+                                self.values["hall2"] = 0
+                                self.values["hall3"] = 0
                                 self.values["ax"] = float(ax)
                                 self.values["ay"] = float(ay)
                                 self.values["az"] = float(az)
@@ -259,6 +295,9 @@ class FlexReader(threading.Thread):
                                 self.values["pinky"] = float(pk)
                                 self.values["thumb"] = int(t)
                                 self.values["hall"] = int(h)
+                                self.values["hall1"] = int(h)
+                                self.values["hall2"] = 0
+                                self.values["hall3"] = 0
                                 self.values["ax"] = 0.0
                                 self.values["ay"] = 0.0
                                 self.values["az"] = 0.0
@@ -278,6 +317,9 @@ class FlexReader(threading.Thread):
                                 self.values["pinky"] = float(pk)
                                 self.values["thumb"] = int(t)
                                 self.values["hall"] = 0
+                                self.values["hall1"] = 0
+                                self.values["hall2"] = 0
+                                self.values["hall3"] = 0
                                 self.values["ax"] = 0.0
                                 self.values["ay"] = 0.0
                                 self.values["az"] = 0.0
@@ -300,6 +342,9 @@ class FlexReader(threading.Thread):
                                         self.values[f] = partial[f]
                                     self.values["thumb"] = int(tm.group(1))
                                     self.values["hall"] = 0
+                                    self.values["hall1"] = 0
+                                    self.values["hall2"] = 0
+                                    self.values["hall3"] = 0
                                     self.values["ax"] = 0.0
                                     self.values["ay"] = 0.0
                                     self.values["az"] = 0.0
@@ -459,7 +504,7 @@ def main():
     print(f"MIDI out: {args.midi_port}")
     print(f"Camera index: {args.camera_index}")
     print("Q to quit")
-    print("Hall sensor -> CC64 (sustain), IMU -> CC10/CC11")
+    print("Hall sensors -> CC64 (sustain), IMU -> CC10/CC11")
 
     frame_counter = 0
     camera_bends = {f: 0.0 for f in note_pool_order}
@@ -476,6 +521,7 @@ def main():
                 with chord_lock:
                     notes = new_notes
                     chord_name = new_name
+                print(f"[chord] {chord_name} notes={notes}")
                 chord_changed.set()
                 next_chord_change = now + random.uniform(args.chord_min, args.chord_max)
 
@@ -596,7 +642,8 @@ def main():
                 status = f"BT ERR: {serial_err[:40]}"
 
             imu_text = f"ay:{float(flex.get('ay', 0.0)):+.2f} gz:{float(flex.get('gz', 0.0)):+.2f}"
-            cv2.putText(frame, f"{status} thumb:{flex['thumb']} hall:{flex.get('hall', 0)} {imu_text} mode:{args.thumb_mode}", (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2)
+            hall_text = f"h:{flex.get('hall', 0)}({flex.get('hall1', 0)},{flex.get('hall2', 0)},{flex.get('hall3', 0)})"
+            cv2.putText(frame, f"{status} thumb:{flex['thumb']} {hall_text} {imu_text} mode:{args.thumb_mode}", (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2)
             mode_text = "fusion" if camera_enabled else "flex-only"
             cv2.putText(frame, f"Chord: {chord_name}", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
             cv2.putText(frame, f"Ch1 melody ({mode_text}) | Ch2 pad", (10, frame.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 200, 255), 1)
