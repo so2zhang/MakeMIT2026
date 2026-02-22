@@ -20,6 +20,7 @@ import mediapipe as mp
 import mido
 import numpy as np
 import serial
+from chord_library import ChordSequencePlayer
 
 if not hasattr(serial, "Serial"):
     raise SystemExit(
@@ -371,6 +372,7 @@ def parse_args():
     parser.add_argument("--thumb-mode", choices=["below", "above", "off"], default="off")
     parser.add_argument("--chord-min", type=float, default=5.0)
     parser.add_argument("--chord-max", type=float, default=15.0)
+    parser.add_argument("--chord-source", choices=["library", "markov"], default="library")
     return parser.parse_args()
 
 
@@ -433,8 +435,14 @@ def main():
     reader = FlexReader(args.port, args.baud)
     reader.start()
 
-    notes = [args.key_root, args.key_root + 4, args.key_root + 7, args.key_root + 11]
-    chord_name = "Imaj7"
+    chord_player = ChordSequencePlayer()
+    if args.chord_source == "library":
+        start = chord_player.current()
+        notes = list(start.notes)
+        chord_name = start.name
+    else:
+        notes = [args.key_root, args.key_root + 4, args.key_root + 7, args.key_root + 11]
+        chord_name = "Imaj7"
     next_chord_change = time.time() + random.uniform(args.chord_min, args.chord_max)
 
     chord_lock = threading.Lock()
@@ -505,6 +513,7 @@ def main():
     print(f"Camera index: {args.camera_index}")
     print("Q to quit")
     print("Hall sensors -> CC64 (sustain), IMU -> CC10/CC11")
+    print(f"[chord] {chord_name} notes={notes}")
 
     frame_counter = 0
     camera_bends = {f: 0.0 for f in note_pool_order}
@@ -517,7 +526,11 @@ def main():
             now = time.time()
             if now >= next_chord_change:
                 release_melody()
-                new_notes, new_name = generate_next_chord_midi(notes, args.key_root)
+                if args.chord_source == "library":
+                    nxt = chord_player.next()
+                    new_notes, new_name = list(nxt.notes), nxt.name
+                else:
+                    new_notes, new_name = generate_next_chord_midi(notes, args.key_root)
                 with chord_lock:
                     notes = new_notes
                     chord_name = new_name
