@@ -1,15 +1,16 @@
 """Reusable chord voicing library for glove playback."""
 
 from dataclasses import dataclass
+from typing import List, Optional
 
 
 @dataclass(frozen=True)
 class ChordVoicing:
     name: str
-    notes: list[int]
+    notes: List[int]
 
 
-DEFAULT_SEQUENCE: list[ChordVoicing] = [
+DEFAULT_SEQUENCE: List[ChordVoicing] = [
     ChordVoicing("vim9", [69, 72, 76, 79]),
     ChordVoicing("vim7", [69, 72, 76, 79]),
     ChordVoicing("Vsus4", [67, 72, 74]),
@@ -21,7 +22,7 @@ DEFAULT_SEQUENCE: list[ChordVoicing] = [
 class ChordSequencePlayer:
     """Cycles through a fixed sequence of named chord voicings."""
 
-    def __init__(self, sequence: list[ChordVoicing] | None = None):
+    def __init__(self, sequence: Optional[List[ChordVoicing]] = None):
         self.sequence = sequence or DEFAULT_SEQUENCE
         self.index = 0
 

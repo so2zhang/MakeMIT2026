@@ -8,12 +8,18 @@
 """
 
 import argparse
+import math
 import os
 import random
 import re
+import shutil
+import struct
+import subprocess
 import threading
+import tempfile
 import time
 import urllib.request
+import wave
 
 import cv2
 import mediapipe as mp
@@ -60,6 +66,7 @@ GLOVE_IMU_HALL3_CSV_RE = re.compile(
     r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),"
     r"(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+),(-?[0-9]*\.?[0-9]+)\s*$"
 )
+HALL_3_RE = re.compile(r"^HALL,([01]),([01]),([01])\s*$")
 LEGACY_FINGER_RE = re.compile(
     r"^(Pointer|Middle|Ring|Pinky) Finger:\s*([0-9]*\.?[0-9]+)\s*V$", re.IGNORECASE
 )
@@ -395,6 +402,86 @@ def list_cameras(max_index=8):
     return found
 
 
+class BasicNoiseOutput:
+    """Simple audio output using generated WAV files and afplay (macOS)."""
+
+    def __init__(self):
+        self.sample_rate = 22050
+        self.tmp_dir = tempfile.mkdtemp(prefix="glove_audio_")
+        self.cache = {}
+        self.active = {}
+        self.afplay = shutil.which("afplay")
+        if not self.afplay:
+            print("Warning: afplay not found; audio output disabled.")
+
+    @staticmethod
+    def _midi_to_freq(note):
+        return 440.0 * (2.0 ** ((note - 69) / 12.0))
+
+    def _wave_path(self, note, channel):
+        key = (note, channel)
+        if key in self.cache:
+            return self.cache[key]
+
+        duration = 2.0 if channel == 1 else 0.8
+        frames = int(self.sample_rate * duration)
+        freq = self._midi_to_freq(note)
+        path = os.path.join(self.tmp_dir, f"n{note}_c{channel}.wav")
+
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(self.sample_rate)
+            data = bytearray()
+            for i in range(frames):
+                t = i / self.sample_rate
+                env = 1.0 - (i / frames)
+                s = (
+                    0.68 * math.sin(2 * math.pi * freq * t)
+                    + 0.22 * math.sin(2 * math.pi * (freq * 2.0) * t)
+                    + 0.10 * math.sin(2 * math.pi * (freq * 3.0) * t)
+                )
+                sample = int(max(-1.0, min(1.0, s * env)) * 32767)
+                data += struct.pack("<h", sample)
+            wf.writeframes(data)
+
+        self.cache[key] = path
+        return path
+
+    def send(self, msg):
+        if msg.type == "note_on" and msg.velocity > 0:
+            self.note_on(msg.note, msg.velocity, getattr(msg, "channel", 0))
+            return
+        if msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
+            self.note_off(msg.note, getattr(msg, "channel", 0))
+            return
+        # Ignore CCs in basic audio mode.
+
+    def note_on(self, note, velocity, channel):
+        if not self.afplay:
+            return
+        self.note_off(note, channel)
+        vol = max(0.05, min(1.0, velocity / 127.0))
+        wav_path = self._wave_path(note, channel)
+        proc = subprocess.Popen(
+            [self.afplay, "-v", f"{vol:.2f}", wav_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self.active[(channel, note)] = proc
+
+    def note_off(self, note, channel):
+        proc = self.active.pop((channel, note), None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+    def close(self):
+        for proc in self.active.values():
+            if proc and proc.poll() is None:
+                proc.terminate()
+        self.active.clear()
+
+
 def main():
     args = parse_args()
     if args.list_cameras:
@@ -403,7 +490,8 @@ def main():
     if not args.port:
         raise SystemExit("Missing --port. Example: --port /dev/cu.usbserial-0001")
 
-    midi_out = mido.open_output(args.midi_port, virtual=True)
+    # Use local audio synthesis instead of MIDI routing.
+    midi_out = BasicNoiseOutput()
 
     # Download model if missing
     if not os.path.exists("hand_landmarker.task"):
@@ -509,7 +597,7 @@ def main():
 
     print("Hybrid controller active")
     print(f"Serial/BT: {args.port} @ {args.baud}")
-    print(f"MIDI out: {args.midi_port}")
+    print("Audio out: basic noise synth (afplay)")
     print(f"Camera index: {args.camera_index}")
     print("Q to quit")
     print("Hall sensors -> CC64 (sustain), IMU -> CC10/CC11")
@@ -671,6 +759,8 @@ def main():
     release_melody()
     for n in chord_notes_on:
         midi_out.send(mido.Message("note_off", note=n, velocity=0, channel=chord_channel))
+    if hasattr(midi_out, "close"):
+        midi_out.close()
 
     cap.release()
     cv2.destroyAllWindows()
