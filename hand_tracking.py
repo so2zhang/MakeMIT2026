@@ -97,7 +97,7 @@ with HandLandmarker.create_from_options(options) as landmarker:
 
                 # --- Hand position for octave scaling ---
                 hand_x, hand_y = get_hand_position(hand_landmarks)
-                octave_offset = int(hand_y * 2) * 12  # 0–2 octaves
+                octave_offset = int(hand_y * 4) * 12 - 12  # 0–2 octaves
 
                 # --- Finger note triggering ---
                 bends = get_finger_bends(hand_landmarks)
