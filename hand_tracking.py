@@ -5,25 +5,22 @@
 - Runs MediaPipe hand tracking from webcam.
 - Fuses both to trigger notes and CC controls.
 - Plays evolving Markov chord pad on MIDI channel 2.
+- Thumb sensor ADC value is also mapped continuously to CC27.
 """
 
 import argparse
-import math
 import os
 import random
 import re
-import shutil
-import struct
-import subprocess
 import threading
-import tempfile
 import time
 import urllib.request
-import wave
 
 import cv2
+import math
 import mediapipe as mp
 import mido
+import mido.backends.rtmidi
 import numpy as np
 import serial
 from chord_library import ChordSequencePlayer
@@ -36,18 +33,91 @@ if not hasattr(serial, "Serial"):
     )
 
 
-# --- Flex calibration from your measured values ---
+# ── Madgwick AHRS (ported from imu_visualiser.py) ──────────────────────────
+class MadgwickAHRS:
+    """Minimal Madgwick filter (gyro + accel, no mag). q = [w, x, y, z]"""
+    def __init__(self, beta: float = 0.05, freq: float = 50.0):
+        self.beta = beta
+        self.dt   = 1.0 / freq
+        self.q    = np.array([1.0, 0.0, 0.0, 0.0])
+
+    def reset(self):
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+
+    def update(self, gx, gy, gz, ax, ay, az):
+        """gx/gy/gz in deg/s; ax/ay/az in m/s² (or raw g-units — direction matters, not scale)."""
+        gx, gy, gz = math.radians(gx), math.radians(gy), math.radians(gz)
+        q = self.q
+        w, x, y, z = q
+        norm = math.sqrt(ax*ax + ay*ay + az*az)
+        if norm == 0:
+            return
+        ax, ay, az = ax/norm, ay/norm, az/norm
+        f1 = 2*(x*z - w*y)       - ax
+        f2 = 2*(w*x + y*z)       - ay
+        f3 = 2*(0.5 - x*x - y*y) - az
+        J  = np.array([
+            [-2*y,  2*z, -2*w, 2*x],
+            [ 2*x,  2*w,  2*z, 2*y],
+            [  0,  -4*x, -4*y,  0 ],
+        ])
+        step = J.T @ np.array([f1, f2, f3])
+        n = np.linalg.norm(step)
+        if n:
+            step /= n
+        q_dot = 0.5 * np.array([
+            -x*gx - y*gy - z*gz,
+             w*gx + y*gz - z*gy,
+             w*gy - x*gz + z*gx,
+             w*gz + x*gy - y*gx,
+        ]) - self.beta * step
+        q = q + q_dot * self.dt
+        self.q = q / np.linalg.norm(q)
+
+    def pitch_deg(self) -> float:
+        """Return pitch angle in degrees (−90 … +90)."""
+        w, x, y, z = self.q
+        return math.degrees(math.asin(max(-1.0, min(1.0, 2.0 * (w*y - z*x)))))
+
+
+# --- IMU Pitch → MIDI CC config ---
+PITCH_CC      = 28     # CC number for Madgwick-filtered pitch
+PITCH_DEG_MIN = -90.0  # pitch angle that maps to CC 0
+PITCH_DEG_MAX =  90.0  # pitch angle that maps to CC 127
+PITCH_CC_DEAD = 1      # minimum CC change required to send
+
+
+# --- Flex calibration from measured values ---
+# STRAIGHT_V = voltage when finger is straight (unbent)
+# BENT_V     = voltage when finger is fully bent
+# Note: ring finger is reversed — lower voltage = more bent
 FINGERS = ["pointer", "middle", "ring", "pinky"]
-STRAIGHT_V = {"pointer": 2.85, "middle": 2.36, "ring": 2.22, "pinky": 2.59}
-BENT_V = {"pointer": 3.13, "middle": 2.89, "ring": 2.75, "pinky": 3.11}
+STRAIGHT_V = {"pointer": 2.9,  "middle": 2.4,  "ring": 2.34,  "pinky": 2.8}
+BENT_V     = {"pointer": 2.6,  "middle": 2.0,  "ring": 2.8, "pinky": 3.2}
 FLEX_THRESH = {f: (STRAIGHT_V[f] + BENT_V[f]) / 2.0 for f in FINGERS}
 
-# Fused bend thresholds (0..1)
-ON_THRESH = 0.62
-OFF_THRESH = 0.45
-FLEX_WEIGHT = 0.7
-CAM_WEIGHT = 0.3
-SMOOTH_ALPHA = 0.28
+# Velocity (rate-of-change) trigger parameters
+# The trigger compares a fast EMA against a slow EMA of the normalised flex
+# value; the difference is the instantaneous bend velocity (0..1 per frame).
+FLEX_WEIGHT    = 0.7   # weight of glove sensor vs camera in fused bend
+CAM_WEIGHT     = 0.3
+SMOOTH_ALPHA   = 0.15  # slow EMA — tracks absolute position, filters noise
+VEL_ALPHA      = 0.55  # fast EMA — tracks rapid changes
+VEL_ON_THRESH  = 0.08  # positive velocity spike needed to trigger note-on
+VEL_OFF_THRESH = 0.06  # negative velocity spike (magnitude) to trigger note-off
+VEL_VEL_MIN    = 0.08  # velocity spike that maps to MIDI velocity 40
+VEL_VEL_MAX    = 0.55  # velocity spike that maps to MIDI velocity 127
+NOTE_MAX_AGE   = 4.0   # seconds — auto-release notes held longer than this
+
+# Thumb sensor CC mapping
+# -------------------------
+# CC27 is sent continuously as the thumb ADC value rises/falls.
+# Adjust THUMB_ADC_MIN / THUMB_ADC_MAX to match your sensor's actual range.
+# The ESP32 12-bit ADC spans 0–4095; trim these if your sensor saturates earlier.
+THUMB_CC        = 27    # MIDI CC number assigned to the thumb sensor
+THUMB_ADC_MIN   = 0     # raw ADC value that maps to CC 0
+THUMB_ADC_MAX   = 4095  # raw ADC value that maps to CC 127
+THUMB_CC_DEAD   = 2     # minimum CC change required to send (avoids jitter spam)
 
 # Parse both new and legacy ESP32 formats
 FLEX_CSV_RE = re.compile(
@@ -169,12 +239,44 @@ def clamp_midi(v):
     return max(0, min(127, int(v)))
 
 
+def pitch_to_octave(pitch_deg: float) -> int:
+    """Return a randomly sampled octave offset (−2 … +2) whose probability
+    distribution is centred on a value that tracks IMU pitch.
+
+    pitch_deg = 0   → centre = 0  (uniform-ish, slightly prefers mid octaves)
+    pitch_deg = +90 → centre = +2 (strongly biased toward high octaves)
+    pitch_deg = −90 → centre = −2 (strongly biased toward low octaves)
+
+    A softmax over evenly-spaced logits gives a smooth, bell-shaped
+    distribution that shifts with pitch while always leaving every octave
+    at least some non-zero probability — so surprises still happen.
+    """
+    OCTAVES   = [-2, -1, 0, 1, 2]
+    # Map pitch linearly: −90° → −2.0 centre, +90° → +2.0 centre
+    centre    = (pitch_deg / 90.0) * 2.0
+    # Temperature: lower = more deterministic; 1.0 feels nicely probabilistic
+    TEMP      = 1.0
+    logits    = [-(o - centre) ** 2 / (2 * TEMP ** 2) for o in OCTAVES]
+    # Softmax
+    max_l     = max(logits)
+    exps      = [math.exp(l - max_l) for l in logits]
+    total     = sum(exps)
+    weights   = [e / total for e in exps]
+    return random.choices(OCTAVES, weights=weights)[0]
+
+
 def normalize_flex(finger, voltage):
-    lo = STRAIGHT_V[finger]
-    hi = BENT_V[finger]
-    if hi <= lo:
+    """Returns 0.0 (straight) to 1.0 (fully bent), regardless of which
+    direction the voltage moves for this particular sensor."""
+    lo = min(STRAIGHT_V[finger], BENT_V[finger])
+    hi = max(STRAIGHT_V[finger], BENT_V[finger])
+    if hi == lo:
         return 0.0
-    return max(0.0, min(1.0, (voltage - lo) / (hi - lo)))
+    norm = (voltage - lo) / (hi - lo)
+    # If this sensor reads lower when bent, invert so 1.0 still means bent.
+    if BENT_V[finger] < STRAIGHT_V[finger]:
+        norm = 1.0 - norm
+    return max(0.0, min(1.0, norm))
 
 
 def estimate_bend(landmarks, mcp, pip, dip):
@@ -203,6 +305,17 @@ def get_hand_position(hand_landmarks):
     return float(np.mean(xs)), float(np.mean(ys))
 
 
+def thumb_adc_to_cc(raw_value):
+    """Map raw ESP32 ADC thumb value to a MIDI CC value (0–127)."""
+    if raw_value is None:
+        return 0
+    span = THUMB_ADC_MAX - THUMB_ADC_MIN
+    if span == 0:
+        return 0
+    normalized = (raw_value - THUMB_ADC_MIN) / span
+    return clamp_midi(normalized * 127)
+
+
 class FlexReader(threading.Thread):
     def __init__(self, port, baud):
         super().__init__(daemon=True)
@@ -229,6 +342,26 @@ class FlexReader(threading.Thread):
         self.last_update = 0.0
         self.connected = False
         self.error = None
+        # IMU zero-reference: set to the first valid reading, subtracted from all
+        # subsequent readings so the glove starts at a neutral (0,0,0,0,0,0) pose.
+        # Call recalibrate() to reset to the current orientation at any time.
+        self._imu_calib = None   # (ax, ay, az, gx, gy, gz) or None
+
+    def recalibrate(self):
+        """Reset IMU calibration — next reading becomes the new zero reference."""
+        with self.lock:
+            self._imu_calib = None
+        print("[IMU] Calibration reset — next reading will be the new zero reference.")
+
+    def _apply_imu_calib(self, ax, ay, az, gx, gy, gz):
+        """Subtract the zero-reference from raw IMU values.
+        Sets the reference on the first call (mirrors imu_visualiser.py behaviour)."""
+        if self._imu_calib is None:
+            self._imu_calib = (ax, ay, az, gx, gy, gz)
+            print(f"[IMU] Calibration locked: ax={ax:.3f} ay={ay:.3f} az={az:.3f} "
+                  f"gx={gx:.3f} gy={gy:.3f} gz={gz:.3f}")
+        cx, cy, cz, cgx, cgy, cgz = self._imu_calib
+        return ax-cx, ay-cy, az-cz, gx-cgx, gy-cgy, gz-cgz
 
     def snapshot(self):
         with self.lock:
@@ -252,6 +385,9 @@ class FlexReader(threading.Thread):
                             h1i = int(h1)
                             h2i = int(h2)
                             h3i = int(h3)
+                            cax, cay, caz, cgx, cgy, cgz = self._apply_imu_calib(
+                                float(ax), float(ay), float(az),
+                                float(gx), float(gy), float(gz))
                             with self.lock:
                                 self.values["pointer"] = float(p)
                                 self.values["middle"] = float(m2)
@@ -262,18 +398,21 @@ class FlexReader(threading.Thread):
                                 self.values["hall2"] = h2i
                                 self.values["hall3"] = h3i
                                 self.values["hall"] = 1 if (h1i or h2i or h3i) else 0
-                                self.values["ax"] = float(ax)
-                                self.values["ay"] = float(ay)
-                                self.values["az"] = float(az)
-                                self.values["gx"] = float(gx)
-                                self.values["gy"] = float(gy)
-                                self.values["gz"] = float(gz)
+                                self.values["ax"] = cax
+                                self.values["ay"] = cay
+                                self.values["az"] = caz
+                                self.values["gx"] = cgx
+                                self.values["gy"] = cgy
+                                self.values["gz"] = cgz
                                 self.last_update = time.time()
                             continue
 
                         gi = GLOVE_IMU_CSV_RE.match(line)
                         if gi:
                             p, m2, r, pk, t, h, ax, ay, az, gx, gy, gz = gi.groups()
+                            cax, cay, caz, cgx, cgy, cgz = self._apply_imu_calib(
+                                float(ax), float(ay), float(az),
+                                float(gx), float(gy), float(gz))
                             with self.lock:
                                 self.values["pointer"] = float(p)
                                 self.values["middle"] = float(m2)
@@ -284,12 +423,12 @@ class FlexReader(threading.Thread):
                                 self.values["hall1"] = int(h)
                                 self.values["hall2"] = 0
                                 self.values["hall3"] = 0
-                                self.values["ax"] = float(ax)
-                                self.values["ay"] = float(ay)
-                                self.values["az"] = float(az)
-                                self.values["gx"] = float(gx)
-                                self.values["gy"] = float(gy)
-                                self.values["gz"] = float(gz)
+                                self.values["ax"] = cax
+                                self.values["ay"] = cay
+                                self.values["az"] = caz
+                                self.values["gx"] = cgx
+                                self.values["gy"] = cgy
+                                self.values["gz"] = cgz
                                 self.last_update = time.time()
                             continue
 
@@ -371,13 +510,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Hybrid flex + MediaPipe MIDI glove")
     parser.add_argument("--port", help="Bluetooth/serial port for ESP32")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--midi-port", default="GestureHand MIDI")
+    parser.add_argument("--midi-port", default="GestureHand MIDI",
+                        help="Name of the virtual MIDI output port to create (default: 'GestureHand MIDI')")
+    parser.add_argument("--list-midi", action="store_true",
+                        help="List available MIDI output ports and exit")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index")
     parser.add_argument("--list-cameras", action="store_true", help="Probe and list available camera indexes")
     parser.add_argument("--key-root", type=int, default=60)
     parser.add_argument("--thumb-threshold", type=int, default=1440)
     parser.add_argument("--thumb-mode", choices=["below", "above", "off"], default="off")
-    parser.add_argument("--thumb-synth-threshold", type=int, default=3900)
+    parser.add_argument("--thumb-cc", type=int, default=THUMB_CC,
+                        help=f"MIDI CC number for continuous thumb pressure (default: {THUMB_CC})")
+    parser.add_argument("--thumb-adc-min", type=int, default=THUMB_ADC_MIN,
+                        help=f"Raw ADC value that maps to CC 0 (default: {THUMB_ADC_MIN})")
+    parser.add_argument("--thumb-adc-max", type=int, default=THUMB_ADC_MAX,
+                        help=f"Raw ADC value that maps to CC 127 (default: {THUMB_ADC_MAX})")
     parser.add_argument("--chord-min", type=float, default=5.0)
     parser.add_argument("--chord-max", type=float, default=15.0)
     parser.add_argument("--chord-source", choices=["library", "markov"], default="library")
@@ -403,145 +550,215 @@ def list_cameras(max_index=8):
     return found
 
 
-class BasicNoiseOutput:
-    """Simple audio output using generated WAV files and afplay (macOS)."""
+class MidiOutput:
+    """Pure MIDI output — opens a virtual (or existing) port and forwards all messages.
+    No audio synthesis; sound comes from whatever synth/DAW is listening on the other end."""
 
-    def __init__(self):
-        self.sample_rate = 22050
-        self.tmp_dir = tempfile.mkdtemp(prefix="glove_audio_")
-        self.cache = {}
-        self.active = {}
-        self.effect_detune = False
-        self.effect_drive = False
-        self.effect_echo = False
-        self.thumb_synth = False
-        self.afplay = shutil.which("afplay")
-        if not self.afplay:
-            print("Warning: afplay not found; audio output disabled.")
-
-    @staticmethod
-    def _midi_to_freq(note):
-        return 440.0 * (2.0 ** ((note - 69) / 12.0))
-
-    def _wave_path(self, note, channel, velocity):
-        key = (
-            note,
-            channel,
-            int(self.effect_detune),
-            int(self.effect_drive),
-            int(self.effect_echo),
-            int(self.thumb_synth),
-            int(velocity),
-        )
-        if key in self.cache:
-            return self.cache[key]
-
-        duration = 2.0 if channel == 1 else 0.8
-        frames = int(self.sample_rate * duration)
-        freq = self._midi_to_freq(note)
-        path = os.path.join(
-            self.tmp_dir,
-            f"n{note}_c{channel}_d{int(self.effect_detune)}_x{int(self.effect_drive)}_e{int(self.effect_echo)}_t{int(self.thumb_synth)}_v{int(velocity)}.wav",
-        )
-
-        with wave.open(path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self.sample_rate)
-            data = bytearray()
-            for i in range(frames):
-                t = i / self.sample_rate
-                env = 1.0 - (i / frames)
-                s = (
-                    0.68 * math.sin(2 * math.pi * freq * t)
-                    + 0.22 * math.sin(2 * math.pi * (freq * 2.0) * t)
-                    + 0.10 * math.sin(2 * math.pi * (freq * 3.0) * t)
+    def __init__(self, port_name: str):
+        self.port_name = port_name
+        try:
+            self._port = mido.open_output(port_name, virtual=True)
+            print(f"MIDI virtual port opened: '{port_name}'")
+            print("  Connect your DAW or synth to this port to hear sound.")
+        except Exception as exc:
+            available = mido.get_output_names()
+            print(f"Could not open virtual port '{port_name}': {exc}")
+            if available:
+                self._port = mido.open_output(available[0])
+                print(f"Using existing MIDI port: '{available[0]}'")
+            else:
+                raise SystemExit(
+                    "No MIDI output ports available. Connect a MIDI device or install a "
+                    "virtual MIDI driver (e.g. IAC Driver on macOS, loopMIDI on Windows)."
                 )
-                if self.effect_detune:
-                    s += 0.16 * math.sin(2 * math.pi * (freq * 1.012) * t)
-                if self.effect_echo:
-                    if i > 1800:
-                        td1 = (i - 1800) / self.sample_rate
-                        s += 0.20 * math.sin(2 * math.pi * freq * td1) * (0.8 - i / (frames * 1.2))
-                if self.effect_drive:
-                    s = math.tanh(1.8 * s)
-                if self.thumb_synth:
-                    # Extra bright synth layer when thumb is fully pressed.
-                    s += 0.25 * math.sin(2 * math.pi * (freq * 4.0) * t)
-                    s += 0.12 * math.sin(2 * math.pi * (freq * 5.0) * t)
-                sample = int(max(-1.0, min(1.0, s * env)) * 32767)
-                data += struct.pack("<h", sample)
-            wf.writeframes(data)
 
-        self.cache[key] = path
-        return path
+    def send(self, msg: mido.Message) -> None:
+        self._port.send(msg)
 
-    def send(self, msg):
-        if msg.type == "note_on" and msg.velocity > 0:
-            self.note_on(msg.note, msg.velocity, getattr(msg, "channel", 0))
-            return
-        if msg.type == "note_off" or (msg.type == "note_on" and msg.velocity == 0):
-            self.note_off(msg.note, getattr(msg, "channel", 0))
-            return
-        # Ignore CCs in basic audio mode.
+    def close(self) -> None:
+        # All-notes-off on every channel before closing.
+        for ch in range(16):
+            self._port.send(mido.Message("control_change", channel=ch, control=123, value=0))
+        self._port.close()
 
-    def note_on(self, note, velocity, channel):
-        if not self.afplay:
-            return
-        self.note_off(note, channel)
-        vol = max(0.05, min(1.0, velocity / 127.0))
-        wav_path = self._wave_path(note, channel, velocity)
-        proc = subprocess.Popen(
-            [self.afplay, "-v", f"{vol:.2f}", wav_path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        self.active[(channel, note)] = proc
 
-    def toggle_effect(self, effect_name):
-        if effect_name == "detune":
-            self.effect_detune = not self.effect_detune
-            print(f"[effect] detune={'ON' if self.effect_detune else 'OFF'}")
-        elif effect_name == "drive":
-            self.effect_drive = not self.effect_drive
-            print(f"[effect] drive={'ON' if self.effect_drive else 'OFF'}")
-        elif effect_name == "echo":
-            self.effect_echo = not self.effect_echo
-            print(f"[effect] echo={'ON' if self.effect_echo else 'OFF'}")
+def run_flex_calibration(reader: "FlexReader") -> tuple[dict, dict]:
+    """Interactive OpenCV calibration wizard.
 
-    def set_thumb_pressure(self, fsr_value, threshold):
-        new_state = int(fsr_value) >= int(threshold)
-        if new_state != self.thumb_synth:
-            self.thumb_synth = new_state
-            print(f"[effect] thumb_synth={'ON' if self.thumb_synth else 'OFF'} fsr={int(fsr_value)}")
+    Shows a live voltage display and walks the user through two poses:
+      1. OPEN hand  → becomes STRAIGHT_V  (fingers fully extended)
+       2. CLOSED fist → becomes BENT_V    (fingers fully curled)
 
-    def effect_state_text(self):
-        return f"D:{int(self.effect_detune)} X:{int(self.effect_drive)} E:{int(self.effect_echo)} T:{int(self.thumb_synth)}"
+    Returns (straight_v, bent_v) dicts keyed by finger name.
+    Blocks until both poses are captured or the user skips with S.
+    """
+    SAMPLE_COUNT  = 60      # frames averaged per pose (~1 s at 60 fps)
+    BAR_W, BAR_H  = 400, 28
+    WIN           = "Flex Calibration"
+    COLORS = {
+        "pointer": (255, 100, 100),
+        "middle":  (100, 255, 100),
+        "ring":    (100, 180, 255),
+        "pinky":   (220, 100, 255),
+    }
+    POSE_NAMES  = ["OPEN (straight)", "CLOSED (fist)"]
+    POSE_KEYS   = ["straight", "bent"]
 
-    def note_off(self, note, channel):
-        proc = self.active.pop((channel, note), None)
-        if proc and proc.poll() is None:
-            proc.terminate()
+    captured: dict[str, dict] = {}   # "straight" / "bent" → {finger: voltage}
 
-    def close(self):
-        for proc in self.active.values():
-            if proc and proc.poll() is None:
-                proc.terminate()
-        self.active.clear()
+    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN, 700, 500)
+
+    pose_idx   = 0
+    samples    = {f: [] for f in FINGERS}
+    collecting = False
+    done       = False
+
+    while not done:
+        # ── pull latest voltages ──────────────────────────────────────────
+        flex, _, connected, _ = reader.snapshot()
+
+        frame = np.zeros((500, 700, 3), dtype=np.uint8)
+
+        # Title
+        title = f"Step {pose_idx+1}/2: Hold hand {POSE_NAMES[pose_idx].upper()}"
+        cv2.putText(frame, title, (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+
+        # Connection status
+        conn_col = (0, 220, 0) if connected else (0, 60, 220)
+        cv2.putText(frame, "BT OK" if connected else "waiting for BT…",
+                    (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, conn_col, 1)
+
+        # Per-finger live bars + voltage text
+        y0 = 110
+        for i, f in enumerate(FINGERS):
+            v   = flex[f]
+            col = COLORS[f]
+            lo  = min(STRAIGHT_V[f], BENT_V[f])
+            hi  = max(STRAIGHT_V[f], BENT_V[f])
+            span = hi - lo or 0.5
+            bar_fill = int(BAR_W * max(0.0, min(1.0, (v - lo + 0.1) / (span + 0.2))))
+            y = y0 + i * 65
+
+            cv2.rectangle(frame, (20, y), (20 + BAR_W, y + BAR_H), (50, 50, 50), -1)
+            cv2.rectangle(frame, (20, y), (20 + bar_fill, y + BAR_H), col, -1)
+            cv2.rectangle(frame, (20, y), (20 + BAR_W, y + BAR_H), (160, 160, 160), 1)
+            cv2.putText(frame, f"{f.capitalize():8s}  {v:.3f} V",
+                        (440, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, col, 2)
+
+            # Show collected sample count while collecting
+            if collecting:
+                n = len(samples[f])
+                pct = int(BAR_W * n / SAMPLE_COUNT)
+                cv2.rectangle(frame, (20, y + BAR_H + 2),
+                              (20 + pct, y + BAR_H + 7), (0, 220, 220), -1)
+
+        # Instructions
+        inst_y = 390
+        if not collecting:
+            lines = [
+                f"Hold your hand {POSE_NAMES[pose_idx]}  then press  SPACE  to capture.",
+                "Press  S  to skip calibration and use defaults.",
+            ]
+        else:
+            pct_done = int(100 * len(samples[FINGERS[0]]) / SAMPLE_COUNT)
+            lines = [f"Capturing… {pct_done}%  — keep holding!", ""]
+
+        for li, line in enumerate(lines):
+            cv2.putText(frame, line, (20, inst_y + li * 32),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.62, (220, 220, 60), 1)
+
+        # Already-captured poses tick
+        for pi, pk in enumerate(POSE_KEYS):
+            if pk in captured:
+                cv2.putText(frame, f"✓ {POSE_NAMES[pi]} captured",
+                            (20, 460 + pi * 0), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.55, (0, 220, 0), 1)
+
+        cv2.imshow(WIN, frame)
+        key = cv2.waitKey(16) & 0xFF   # ~60 fps
+
+        # ── collect samples ───────────────────────────────────────────────
+        if collecting:
+            for f in FINGERS:
+                samples[f].append(flex[f])
+            if len(samples[FINGERS[0]]) >= SAMPLE_COUNT:
+                # Average and store
+                captured[POSE_KEYS[pose_idx]] = {
+                    f: float(np.mean(samples[f])) for f in FINGERS
+                }
+                print(f"[CAL] {POSE_NAMES[pose_idx]} captured: "
+                      + ", ".join(f"{f}={captured[POSE_KEYS[pose_idx]][f]:.3f}V"
+                                  for f in FINGERS))
+                samples    = {f: [] for f in FINGERS}
+                collecting = False
+                pose_idx  += 1
+                if pose_idx >= 2:
+                    done = True
+
+        # ── key handling ──────────────────────────────────────────────────
+        if key == ord(" ") and not collecting:
+            collecting = True
+            samples    = {f: [] for f in FINGERS}
+        elif key == ord("s") or key == ord("S"):
+            print("[CAL] Skipped — using default calibration values.")
+            cv2.destroyWindow(WIN)
+            return dict(STRAIGHT_V), dict(BENT_V)
+
+    cv2.destroyWindow(WIN)
+
+    straight = captured.get("straight", dict(STRAIGHT_V))
+    bent     = captured.get("bent",     dict(BENT_V))
+
+    # Sanity check: if a finger's straight/bent are too close, warn and use defaults
+    for f in FINGERS:
+        if abs(straight[f] - bent[f]) < 0.05:
+            print(f"[CAL] Warning: {f} finger range too small "
+                  f"({straight[f]:.3f}V vs {bent[f]:.3f}V) — using defaults.")
+            straight[f] = STRAIGHT_V[f]
+            bent[f]     = BENT_V[f]
+
+    print("[CAL] Calibration complete.")
+    print("[CAL] STRAIGHT_V = " + str({f: round(straight[f], 3) for f in FINGERS}))
+    print("[CAL] BENT_V     = " + str({f: round(bent[f],     3) for f in FINGERS}))
+    return straight, bent
 
 
 def main():
     args = parse_args()
+
     if args.list_cameras:
         list_cameras()
         return
+
+    if args.list_midi:
+        print("Available MIDI output ports:")
+        for name in mido.get_output_names():
+            print(f"  {name}")
+        return
+
     if not args.port:
         raise SystemExit("Missing --port. Example: --port /dev/cu.usbserial-0001")
 
-    # Use local audio synthesis instead of MIDI routing.
-    midi_out = BasicNoiseOutput()
+    midi_out = MidiOutput(args.midi_port)
 
-    # Download model if missing
+    # Allow CLI overrides for thumb CC config
+    thumb_cc_num   = args.thumb_cc
+    thumb_adc_min  = args.thumb_adc_min
+    thumb_adc_max  = args.thumb_adc_max
+
+    def _thumb_adc_to_cc(raw_value):
+        """Map raw ESP32 ADC thumb value to a MIDI CC value (0–127)."""
+        if raw_value is None:
+            return 0
+        span = thumb_adc_max - thumb_adc_min
+        if span == 0:
+            return 0
+        normalized = (raw_value - thumb_adc_min) / span
+        return clamp_midi(normalized * 127)
+
+    # Download MediaPipe model if missing
     if not os.path.exists("hand_landmarker.task"):
         print("Downloading hand_landmarker.task...")
         urllib.request.urlretrieve(
@@ -571,6 +788,29 @@ def main():
     reader = FlexReader(args.port, args.baud)
     reader.start()
 
+    # ── Startup flex calibration ──────────────────────────────────────────
+    # Wait briefly for BT connection before showing the calibration UI
+    print("Waiting for Bluetooth connection…")
+    for _ in range(50):
+        _, _, connected, _ = reader.snapshot()
+        if connected:
+            break
+        time.sleep(0.1)
+
+    cal_straight, cal_bent = run_flex_calibration(reader)
+
+    # Build per-finger normalization closures using calibrated values
+    def normalize_flex_cal(finger: str, voltage: float) -> float:
+        """normalize_flex() using runtime-calibrated STRAIGHT_V / BENT_V."""
+        lo = min(cal_straight[finger], cal_bent[finger])
+        hi = max(cal_straight[finger], cal_bent[finger])
+        if hi == lo:
+            return 0.0
+        norm = (voltage - lo) / (hi - lo)
+        if cal_bent[finger] < cal_straight[finger]:
+            norm = 1.0 - norm
+        return max(0.0, min(1.0, norm))
+
     chord_player = ChordSequencePlayer()
     if args.chord_source == "library":
         start = chord_player.current()
@@ -587,13 +827,23 @@ def main():
     stop_event = threading.Event()
 
     note_pool_order = ["pointer", "middle", "ring", "pinky"]
-    notes_on = {f: None for f in note_pool_order}
-    state_on = {f: False for f in note_pool_order}
-    smooth_v = {}
-    last_cc = {25: -1, 26: -1, 1: -1, 74: -1, 64: -1, 10: -1, 11: -1}
+    notes_on  = {f: None for f in note_pool_order}
+    state_on  = {f: False for f in note_pool_order}
+    smooth_v  = {}   # slow EMA of normalised flex — tracks position
+    fast_v    = {}   # fast EMA of normalised flex — tracks rapid changes
+    note_on_t = {f: 0.0 for f in note_pool_order}  # timestamp of last note-on
+    _smooth_pitch = [0.0]   # EMA of Madgwick pitch for octave selection; list so lambda can write it
+    PITCH_SMOOTH  = 0.05    # EMA alpha — slow enough to ignore quick wrist flicks
+    # CC27 added for continuous thumb pressure; CC28 for Madgwick pitch
+    last_cc = {25: -1, 26: -1, 1: -1, 74: -1, 64: -1, 10: -1, 11: -1,
+               thumb_cc_num: -1, PITCH_CC: -1}
+
+    # Madgwick filter instance — one per run, persists across frames
+    ahrs = MadgwickAHRS(beta=0.05, freq=50.0)
+    _ahrs_last_t = [time.time()]   # mutable container so inner closure can update it
 
     chord_channel = 1  # MIDI channel 2
-    melody_channel = 0
+    melody_channel = 0  # MIDI channel 1
 
     def thumb_allows_play(thumb_val):
         if args.thumb_mode == "off":
@@ -644,19 +894,20 @@ def main():
     chord_changed.set()
 
     print("Hybrid controller active")
-    print(f"Serial/BT: {args.port} @ {args.baud}")
-    print("Audio out: basic noise synth (afplay)")
-    print(f"Camera index: {args.camera_index}")
-    print("Q to quit")
-    print("Hall sensors -> CC64 (sustain), IMU -> CC10/CC11")
+    print(f"Serial/BT:  {args.port} @ {args.baud}")
+    print(f"MIDI out:   {midi_out.port_name}")
+    print(f"Camera:     index {args.camera_index}")
+    print(f"Thumb CC:   CC{thumb_cc_num}  (ADC {thumb_adc_min}–{thumb_adc_max} → 0–127)")
+    print(f"Pitch CC:   CC{PITCH_CC}  (Madgwick {PITCH_DEG_MIN:.0f}°–{PITCH_DEG_MAX:.0f}° → 0–127)")
+    print("Q to quit  |  C to recalibrate IMU zero reference")
+    print("Finger bends -> note on/off (Ch1)  |  Hall -> CC64  |  IMU ay/gz -> CC10/CC11")
+    print(f"Thumb ADC -> CC{thumb_cc_num} (continuous, always active)")
     print(f"[chord] {chord_name} notes={notes}")
 
     frame_counter = 0
     camera_bends = {f: 0.0 for f in note_pool_order}
     hand_x, hand_y = 0.5, 0.5
     hand_detected = False
-    last_telemetry_print = 0.0
-    hall_prev = {"hall1": 0, "hall2": 0, "hall3": 0}
 
     with HandLandmarker.create_from_options(options) as landmarker:
         camera_failures = 0
@@ -676,7 +927,7 @@ def main():
                 chord_changed.set()
                 next_chord_change = now + random.uniform(args.chord_min, args.chord_max)
 
-            # camera
+            # --- Camera frame ---
             if camera_enabled:
                 cap.grab()
                 ret, frame = cap.retrieve()
@@ -703,7 +954,6 @@ def main():
                     lm = result.hand_landmarks[0]
                     camera_bends = get_camera_bends(lm)
                     hand_x, hand_y = get_hand_position(lm)
-
                     h, w, _ = frame.shape
                     for p in lm:
                         cx, cy = int(p.x * w), int(p.y * h)
@@ -712,55 +962,116 @@ def main():
                     hand_detected = False
                     camera_bends = {f: 0.0 for f in note_pool_order}
 
-            # flex snapshot
+            # --- Flex snapshot ---
             flex, flex_ts, connected, serial_err = reader.snapshot()
             flex_fresh = (now - flex_ts) < 1.0
-            fsr_val = int(flex.get("thumb", 0) or 0)
-            if hasattr(midi_out, "set_thumb_pressure"):
-                midi_out.set_thumb_pressure(fsr_val, args.thumb_synth_threshold)
 
-            # Hall effect toggles on rising edges from stable raw 0/1 inputs.
-            h1 = int(flex.get("hall1", 0))
-            h2 = int(flex.get("hall2", 0))
-            h3 = int(flex.get("hall3", 0))
-            if h1 == 1 and hall_prev["hall1"] == 0 and hasattr(midi_out, "toggle_effect"):
-                midi_out.toggle_effect("detune")
-            if h2 == 1 and hall_prev["hall2"] == 0 and hasattr(midi_out, "toggle_effect"):
-                midi_out.toggle_effect("drive")
-            if h3 == 1 and hall_prev["hall3"] == 0 and hasattr(midi_out, "toggle_effect"):
-                midi_out.toggle_effect("echo")
-            hall_prev["hall1"], hall_prev["hall2"], hall_prev["hall3"] = h1, h2, h3
-
-            # Smooth flex
+            # --- EMA updates (slow + fast) for velocity detection ---
             for f in note_pool_order:
+                raw_norm = normalize_flex_cal(f, flex[f])
                 if f not in smooth_v:
-                    smooth_v[f] = flex[f]
-                smooth_v[f] = (1.0 - SMOOTH_ALPHA) * smooth_v[f] + SMOOTH_ALPHA * flex[f]
+                    smooth_v[f] = raw_norm
+                    fast_v[f]   = raw_norm
+                smooth_v[f] = (1.0 - SMOOTH_ALPHA) * smooth_v[f] + SMOOTH_ALPHA * raw_norm
+                fast_v[f]   = (1.0 - VEL_ALPHA)    * fast_v[f]   + VEL_ALPHA   * raw_norm
 
+            # ----------------------------------------------------------------
+            # Thumb CC — sent unconditionally every loop (independent of
+            # thumb_mode gate) so the knob always tracks the physical sensor.
+            # ----------------------------------------------------------------
+            thumb_raw = flex.get("thumb")
+            cc_thumb = _thumb_adc_to_cc(thumb_raw)
+            if abs(cc_thumb - last_cc[thumb_cc_num]) > THUMB_CC_DEAD:
+                midi_out.send(mido.Message(
+                    "control_change",
+                    control=thumb_cc_num,
+                    value=cc_thumb,
+                    channel=melody_channel,
+                ))
+                last_cc[thumb_cc_num] = cc_thumb
+
+            # ----------------------------------------------------------------
+            # Madgwick pitch -> CC28 — always active, independent of gate
+            # ----------------------------------------------------------------
+            _now_ahrs = time.time()
+            _dt_ahrs  = max(0.005, min(_now_ahrs - _ahrs_last_t[0], 0.1))
+            _ahrs_last_t[0] = _now_ahrs
+            ahrs.dt = _dt_ahrs
+
+            _ax = float(flex.get("ax", 0.0))
+            _ay = float(flex.get("ay", 0.0))
+            _az = float(flex.get("az", 0.0))
+            _gx = float(flex.get("gx", 0.0))
+            _gy = float(flex.get("gy", 0.0))
+            _gz = float(flex.get("gz", 0.0))
+
+            # Zero-rate gyro deadband — matches imu_visualiser.py
+            GYRO_DEAD = 0.5
+            _gx = 0.0 if abs(_gx) < GYRO_DEAD else _gx
+            _gy = 0.0 if abs(_gy) < GYRO_DEAD else _gy
+            _gz = 0.0 if abs(_gz) < GYRO_DEAD else _gz
+
+            if flex_fresh:
+                ahrs.update(_gx, _gy, _gz, _ax, _ay, _az)
+
+            _pitch_deg = ahrs.pitch_deg()
+            # Smooth pitch for octave selection — filters out fast wrist twitches
+            _smooth_pitch[0] = (1.0 - PITCH_SMOOTH) * _smooth_pitch[0] + PITCH_SMOOTH * _pitch_deg
+            _pitch_span = PITCH_DEG_MAX - PITCH_DEG_MIN
+            cc_pitch = clamp_midi(((_pitch_deg - PITCH_DEG_MIN) / _pitch_span) * 127.0)
+            if abs(cc_pitch - last_cc[PITCH_CC]) > PITCH_CC_DEAD:
+                midi_out.send(mido.Message(
+                    "control_change",
+                    control=PITCH_CC,
+                    value=cc_pitch,
+                    channel=melody_channel,
+                ))
+                last_cc[PITCH_CC] = cc_pitch
+
+            # ----------------------------------------------------------------
+            # Velocity-based note triggers
+            # fast_v - smooth_v = instantaneous bend velocity (positive = closing)
+            # ----------------------------------------------------------------
             if flex_fresh and thumb_allows_play(flex["thumb"]):
                 with chord_lock:
                     pool = sorted(set(notes))
 
                 for idx, f in enumerate(note_pool_order):
-                    flex_norm = normalize_flex(f, smooth_v[f])
-                    cam_norm = camera_bends.get(f, 0.0) if hand_detected else 0.0
-                    fused = (FLEX_WEIGHT * flex_norm) + (CAM_WEIGHT * cam_norm)
+                    cam_norm        = camera_bends.get(f, 0.0) if hand_detected else 0.0
+                    # Blend camera and glove velocity signals
+                    vel_signal      = (FLEX_WEIGHT * (fast_v[f] - smooth_v[f])
+                                       + CAM_WEIGHT * cam_norm * 0.3)
 
-                    if (not state_on[f]) and fused >= ON_THRESH:
-                        state_on[f] = True
-                        octave = int((1.0 - hand_y) * 3) - 1 if hand_detected else 0
-                        base_note = pool[idx % len(pool)]
-                        note = clamp_midi(base_note + (12 * octave))
-                        vel = clamp_midi(80 + int(40 * fused) + random.randint(-8, 8))
-                        notes_on[f] = note
-                        midi_out.send(mido.Message("note_on", note=note, velocity=vel, channel=melody_channel))
-                    elif state_on[f] and fused <= OFF_THRESH:
+                    # Auto-release: drop note if held longer than NOTE_MAX_AGE
+                    if state_on[f] and (now - note_on_t[f]) > NOTE_MAX_AGE:
                         state_on[f] = False
                         if notes_on[f] is not None:
-                            midi_out.send(mido.Message("note_off", note=notes_on[f], velocity=0, channel=melody_channel))
+                            midi_out.send(mido.Message("note_off", note=notes_on[f],
+                                                       velocity=0, channel=melody_channel))
                             notes_on[f] = None
 
-                # CC from camera (XY)
+                    # Note-on: positive spike above threshold (finger closing fast)
+                    if (not state_on[f]) and vel_signal > VEL_ON_THRESH:
+                        state_on[f]  = True
+                        note_on_t[f] = now
+                        octave       = pitch_to_octave(_smooth_pitch[0])
+                        base_note    = pool[idx % len(pool)]
+                        note         = clamp_midi(base_note + (12 * octave))
+                        vel_norm     = (vel_signal - VEL_VEL_MIN) / max(VEL_VEL_MAX - VEL_VEL_MIN, 1e-6)
+                        vel          = clamp_midi(40 + int(87 * max(0.0, min(1.0, vel_norm))))
+                        notes_on[f]  = note
+                        midi_out.send(mido.Message("note_on", note=note, velocity=vel,
+                                                   channel=melody_channel))
+
+                    # Note-off: negative spike (finger opening fast)
+                    elif state_on[f] and vel_signal < -VEL_OFF_THRESH:
+                        state_on[f] = False
+                        if notes_on[f] is not None:
+                            midi_out.send(mido.Message("note_off", note=notes_on[f],
+                                                       velocity=0, channel=melody_channel))
+                            notes_on[f] = None
+
+                # CC from camera XY position
                 if hand_detected:
                     cc_x = clamp_midi(hand_x * 127)
                     cc_y = clamp_midi((1.0 - hand_y) * 127)
@@ -771,13 +1082,12 @@ def main():
                         midi_out.send(mido.Message("control_change", control=26, value=cc_y, channel=melody_channel))
                         last_cc[26] = cc_y
 
-                # CC from flex/combined
-                cc_mod = clamp_midi(normalize_flex("pointer", smooth_v["pointer"]) * 127)
-                cc_bri = clamp_midi(normalize_flex("ring", smooth_v["ring"]) * 127)
+                # CC from flex sensors and IMU
+                cc_mod = clamp_midi(normalize_flex_cal("pointer", smooth_v["pointer"]) * 127)
+                cc_bri = clamp_midi(normalize_flex_cal("ring", smooth_v["ring"]) * 127)
                 cc_sus = 127 if int(flex.get("hall", 0)) == 1 else 0
-                # Map IMU tilt/rotation to extra expression controls.
-                cc_pan = clamp_midi(((float(flex.get("ay", 0.0)) + 10.0) / 20.0) * 127.0)   # CC10
-                cc_exp = clamp_midi(((float(flex.get("gz", 0.0)) + 250.0) / 500.0) * 127.0) # CC11
+                cc_pan = clamp_midi(((float(flex.get("ay", 0.0)) + 10.0) / 20.0) * 127.0)
+                cc_exp = clamp_midi(((float(flex.get("gz", 0.0)) + 250.0) / 500.0) * 127.0)
                 if abs(cc_mod - last_cc[1]) > 1:
                     midi_out.send(mido.Message("control_change", control=1, value=cc_mod, channel=melody_channel))
                     last_cc[1] = cc_mod
@@ -796,48 +1106,46 @@ def main():
             else:
                 release_melody()
 
-            # HUD
+            # --- HUD overlay ---
             y = 25
             for f in note_pool_order:
-                text = f"{f[:3]} {smooth_v[f]:.2f}V cam:{camera_bends.get(f, 0.0):.2f} {'ON' if state_on[f] else 'OFF'}"
-                cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+                vel_sig = (fast_v.get(f, 0.0) - smooth_v.get(f, 0.0)) * FLEX_WEIGHT
+                state_str = "ON " if state_on[f] else "---"
+                text = (f"{f[:3]} slow:{smooth_v.get(f,0):.2f} fast:{fast_v.get(f,0):.2f} "
+                        f"vel:{vel_sig:+.3f} {state_str}")
                 y += 22
 
             status = "BT OK" if connected and flex_fresh else "BT WAIT"
             if serial_err:
                 status = f"BT ERR: {serial_err[:40]}"
 
-            imu_text = f"ay:{float(flex.get('ay', 0.0)):+.2f} gz:{float(flex.get('gz', 0.0)):+.2f}"
+            imu_text = (
+                f"ay:{float(flex.get('ay', 0.0)):+.2f} gz:{float(flex.get('gz', 0.0)):+.2f} "
+                f"pitch:{_pitch_deg:+.1f}° (oct~{(_smooth_pitch[0]/90.0*2.0):+.1f}) CC{PITCH_CC}:{last_cc[PITCH_CC]}"
+            )
             hall_text = f"h:{flex.get('hall', 0)}({flex.get('hall1', 0)},{flex.get('hall2', 0)},{flex.get('hall3', 0)})"
-            effect_text = midi_out.effect_state_text() if hasattr(midi_out, "effect_state_text") else ""
-            cv2.putText(frame, f"{status} fsr:{fsr_val} {hall_text} {imu_text} {effect_text} mode:{args.thumb_mode}", (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2)
-            y += 24
+            thumb_cc_display = last_cc[thumb_cc_num] if last_cc[thumb_cc_num] >= 0 else 0
             cv2.putText(
                 frame,
-                f"Chord now: {chord_name} notes={notes}",
-                (10, y + 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (160, 255, 160),
-                1,
+                f"{status} thumb:{flex['thumb']} CC{thumb_cc_num}:{thumb_cc_display} {hall_text} {imu_text} mode:{args.thumb_mode}",
+                (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2,
             )
             mode_text = "fusion" if camera_enabled else "flex-only"
-            cv2.putText(frame, f"Chord: {chord_name}", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
-            cv2.putText(frame, f"Ch1 melody ({mode_text}) | Ch2 pad", (10, frame.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 200, 255), 1)
-
-            # Console telemetry so live updates are visible even if the HUD window is tiny.
-            if now - last_telemetry_print > 0.8:
-                print(
-                    f"[live] {status} "
-                    f"p:{smooth_v['pointer']:.2f} m:{smooth_v['middle']:.2f} r:{smooth_v['ring']:.2f} pk:{smooth_v['pinky']:.2f} "
-                    f"fsr:{fsr_val} h({int(flex.get('hall1', 0))},{int(flex.get('hall2', 0))},{int(flex.get('hall3', 0))}) "
-                    f"imu(ay:{float(flex.get('ay', 0.0)):+.2f},gz:{float(flex.get('gz', 0.0)):+.2f}) chord:{chord_name}"
-                )
-                last_telemetry_print = now
+            cv2.putText(frame, f"Chord: {chord_name}",
+                        (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
+            cv2.putText(frame, f"Ch1 melody ({mode_text}) | Ch2 pad  ->  {midi_out.port_name}  [C=recal IMU]",
+                        (10, frame.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 200, 255), 1)
 
             cv2.imshow("Hybrid Glove + Camera MIDI", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            elif key == ord("c"):
+                # Re-zero IMU relative to current pose; also reset Madgwick so
+                # the filter starts fresh from the new reference orientation.
+                reader.recalibrate()
+                ahrs.reset()
+                print("[IMU] Madgwick filter reset.")
 
     stop_event.set()
     chord_changed.set()
@@ -845,8 +1153,7 @@ def main():
     release_melody()
     for n in chord_notes_on:
         midi_out.send(mido.Message("note_off", note=n, velocity=0, channel=chord_channel))
-    if hasattr(midi_out, "close"):
-        midi_out.close()
+    midi_out.close()
 
     cap.release()
     cv2.destroyAllWindows()

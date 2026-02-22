@@ -32,6 +32,8 @@ import numpy as np
 import serial
 
 
+calib = None
+
 # ── Madgwick AHRS ──────────────────────────────────────────────────────────
 class MadgwickAHRS:
     """
@@ -114,6 +116,7 @@ class IMUReader(threading.Thread):
             return self._buf[-1] if self._buf else None
 
     def run(self):
+        global calib
         while True:   # outer loop: reconnect on any error
             try:
                 ser = serial.Serial(self.port, self.baud, timeout=2)
@@ -129,10 +132,18 @@ class IMUReader(threading.Thread):
                             raise serial.SerialTimeoutException("No data received")
                         continue
                     consecutive_timeouts = 0
-                    parts = line.split(',')
+                    parts = line.split(',')[-6:]
+                    print(parts)
                     if len(parts) == 6:
                         try:
-                            vals = tuple(float(p) for p in parts)
+                            vals = list(float(p) for p in parts)
+                            if calib is None:
+                                # Use first reading as calibration reference (zero orientation)
+                                calib = vals
+                                print(f"Calibration set: {calib}")
+                            
+                            # Subtract calibration reference to get relative motion
+                            vals = [v - c for v, c in zip(vals, calib)]
                             with self._lock:
                                 self._buf.append(vals)
                         except ValueError:
