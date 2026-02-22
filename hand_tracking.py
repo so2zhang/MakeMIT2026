@@ -377,6 +377,7 @@ def parse_args():
     parser.add_argument("--key-root", type=int, default=60)
     parser.add_argument("--thumb-threshold", type=int, default=1440)
     parser.add_argument("--thumb-mode", choices=["below", "above", "off"], default="off")
+    parser.add_argument("--thumb-synth-threshold", type=int, default=3900)
     parser.add_argument("--chord-min", type=float, default=5.0)
     parser.add_argument("--chord-max", type=float, default=15.0)
     parser.add_argument("--chord-source", choices=["library", "markov"], default="library")
@@ -410,6 +411,10 @@ class BasicNoiseOutput:
         self.tmp_dir = tempfile.mkdtemp(prefix="glove_audio_")
         self.cache = {}
         self.active = {}
+        self.effect_detune = False
+        self.effect_drive = False
+        self.effect_echo = False
+        self.thumb_synth = False
         self.afplay = shutil.which("afplay")
         if not self.afplay:
             print("Warning: afplay not found; audio output disabled.")
@@ -418,15 +423,26 @@ class BasicNoiseOutput:
     def _midi_to_freq(note):
         return 440.0 * (2.0 ** ((note - 69) / 12.0))
 
-    def _wave_path(self, note, channel):
-        key = (note, channel)
+    def _wave_path(self, note, channel, velocity):
+        key = (
+            note,
+            channel,
+            int(self.effect_detune),
+            int(self.effect_drive),
+            int(self.effect_echo),
+            int(self.thumb_synth),
+            int(velocity),
+        )
         if key in self.cache:
             return self.cache[key]
 
         duration = 2.0 if channel == 1 else 0.8
         frames = int(self.sample_rate * duration)
         freq = self._midi_to_freq(note)
-        path = os.path.join(self.tmp_dir, f"n{note}_c{channel}.wav")
+        path = os.path.join(
+            self.tmp_dir,
+            f"n{note}_c{channel}_d{int(self.effect_detune)}_x{int(self.effect_drive)}_e{int(self.effect_echo)}_t{int(self.thumb_synth)}_v{int(velocity)}.wav",
+        )
 
         with wave.open(path, "wb") as wf:
             wf.setnchannels(1)
@@ -441,6 +457,18 @@ class BasicNoiseOutput:
                     + 0.22 * math.sin(2 * math.pi * (freq * 2.0) * t)
                     + 0.10 * math.sin(2 * math.pi * (freq * 3.0) * t)
                 )
+                if self.effect_detune:
+                    s += 0.16 * math.sin(2 * math.pi * (freq * 1.012) * t)
+                if self.effect_echo:
+                    if i > 1800:
+                        td1 = (i - 1800) / self.sample_rate
+                        s += 0.20 * math.sin(2 * math.pi * freq * td1) * (0.8 - i / (frames * 1.2))
+                if self.effect_drive:
+                    s = math.tanh(1.8 * s)
+                if self.thumb_synth:
+                    # Extra bright synth layer when thumb is fully pressed.
+                    s += 0.25 * math.sin(2 * math.pi * (freq * 4.0) * t)
+                    s += 0.12 * math.sin(2 * math.pi * (freq * 5.0) * t)
                 sample = int(max(-1.0, min(1.0, s * env)) * 32767)
                 data += struct.pack("<h", sample)
             wf.writeframes(data)
@@ -462,13 +490,33 @@ class BasicNoiseOutput:
             return
         self.note_off(note, channel)
         vol = max(0.05, min(1.0, velocity / 127.0))
-        wav_path = self._wave_path(note, channel)
+        wav_path = self._wave_path(note, channel, velocity)
         proc = subprocess.Popen(
             [self.afplay, "-v", f"{vol:.2f}", wav_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         self.active[(channel, note)] = proc
+
+    def toggle_effect(self, effect_name):
+        if effect_name == "detune":
+            self.effect_detune = not self.effect_detune
+            print(f"[effect] detune={'ON' if self.effect_detune else 'OFF'}")
+        elif effect_name == "drive":
+            self.effect_drive = not self.effect_drive
+            print(f"[effect] drive={'ON' if self.effect_drive else 'OFF'}")
+        elif effect_name == "echo":
+            self.effect_echo = not self.effect_echo
+            print(f"[effect] echo={'ON' if self.effect_echo else 'OFF'}")
+
+    def set_thumb_pressure(self, fsr_value, threshold):
+        new_state = int(fsr_value) >= int(threshold)
+        if new_state != self.thumb_synth:
+            self.thumb_synth = new_state
+            print(f"[effect] thumb_synth={'ON' if self.thumb_synth else 'OFF'} fsr={int(fsr_value)}")
+
+    def effect_state_text(self):
+        return f"D:{int(self.effect_detune)} X:{int(self.effect_drive)} E:{int(self.effect_echo)} T:{int(self.thumb_synth)}"
 
     def note_off(self, note, channel):
         proc = self.active.pop((channel, note), None)
@@ -607,6 +655,8 @@ def main():
     camera_bends = {f: 0.0 for f in note_pool_order}
     hand_x, hand_y = 0.5, 0.5
     hand_detected = False
+    last_telemetry_print = 0.0
+    hall_prev = {"hall1": 0, "hall2": 0, "hall3": 0}
 
     with HandLandmarker.create_from_options(options) as landmarker:
         camera_failures = 0
@@ -665,6 +715,21 @@ def main():
             # flex snapshot
             flex, flex_ts, connected, serial_err = reader.snapshot()
             flex_fresh = (now - flex_ts) < 1.0
+            fsr_val = int(flex.get("thumb", 0) or 0)
+            if hasattr(midi_out, "set_thumb_pressure"):
+                midi_out.set_thumb_pressure(fsr_val, args.thumb_synth_threshold)
+
+            # Hall effect toggles on rising edges from stable raw 0/1 inputs.
+            h1 = int(flex.get("hall1", 0))
+            h2 = int(flex.get("hall2", 0))
+            h3 = int(flex.get("hall3", 0))
+            if h1 == 1 and hall_prev["hall1"] == 0 and hasattr(midi_out, "toggle_effect"):
+                midi_out.toggle_effect("detune")
+            if h2 == 1 and hall_prev["hall2"] == 0 and hasattr(midi_out, "toggle_effect"):
+                midi_out.toggle_effect("drive")
+            if h3 == 1 and hall_prev["hall3"] == 0 and hasattr(midi_out, "toggle_effect"):
+                midi_out.toggle_effect("echo")
+            hall_prev["hall1"], hall_prev["hall2"], hall_prev["hall3"] = h1, h2, h3
 
             # Smooth flex
             for f in note_pool_order:
@@ -744,10 +809,31 @@ def main():
 
             imu_text = f"ay:{float(flex.get('ay', 0.0)):+.2f} gz:{float(flex.get('gz', 0.0)):+.2f}"
             hall_text = f"h:{flex.get('hall', 0)}({flex.get('hall1', 0)},{flex.get('hall2', 0)},{flex.get('hall3', 0)})"
-            cv2.putText(frame, f"{status} thumb:{flex['thumb']} {hall_text} {imu_text} mode:{args.thumb_mode}", (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2)
+            effect_text = midi_out.effect_state_text() if hasattr(midi_out, "effect_state_text") else ""
+            cv2.putText(frame, f"{status} fsr:{fsr_val} {hall_text} {imu_text} {effect_text} mode:{args.thumb_mode}", (10, y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 220, 120), 2)
+            y += 24
+            cv2.putText(
+                frame,
+                f"Chord now: {chord_name} notes={notes}",
+                (10, y + 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (160, 255, 160),
+                1,
+            )
             mode_text = "fusion" if camera_enabled else "flex-only"
             cv2.putText(frame, f"Chord: {chord_name}", (10, frame.shape[0] - 45), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
             cv2.putText(frame, f"Ch1 melody ({mode_text}) | Ch2 pad", (10, frame.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (150, 200, 255), 1)
+
+            # Console telemetry so live updates are visible even if the HUD window is tiny.
+            if now - last_telemetry_print > 0.8:
+                print(
+                    f"[live] {status} "
+                    f"p:{smooth_v['pointer']:.2f} m:{smooth_v['middle']:.2f} r:{smooth_v['ring']:.2f} pk:{smooth_v['pinky']:.2f} "
+                    f"fsr:{fsr_val} h({int(flex.get('hall1', 0))},{int(flex.get('hall2', 0))},{int(flex.get('hall3', 0))}) "
+                    f"imu(ay:{float(flex.get('ay', 0.0)):+.2f},gz:{float(flex.get('gz', 0.0)):+.2f}) chord:{chord_name}"
+                )
+                last_telemetry_print = now
 
             cv2.imshow("Hybrid Glove + Camera MIDI", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):

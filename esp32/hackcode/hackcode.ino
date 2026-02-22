@@ -24,9 +24,6 @@ BluetoothSerial SerialBT;
 volatile bool btConnected = false;
 float fsrFiltered = 0.0f;
 const float FSR_ALPHA = 0.20f;  // Higher = more responsive, lower = smoother.
-int hallPrev1 = 0;
-int hallPrev2 = 0;
-int hallPrev3 = 0;
 
 void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
   (void)param;
@@ -135,14 +132,10 @@ void loop() {
   const int hallRaw2 = (digitalRead(hallPin2) == LOW) ? 1 : 0;
   const int hallRaw3 = (digitalRead(hallPin3) == LOW) ? 1 : 0;
 
-  // Normalize to binary event pulses:
-  // 1 only on a rising edge (new field detection / voltage change), otherwise 0.
-  const int hallValue1 = (hallRaw1 == 1 && hallPrev1 == 0) ? 1 : 0;
-  const int hallValue2 = (hallRaw2 == 1 && hallPrev2 == 0) ? 1 : 0;
-  const int hallValue3 = (hallRaw3 == 1 && hallPrev3 == 0) ? 1 : 0;
-  hallPrev1 = hallRaw1;
-  hallPrev2 = hallRaw2;
-  hallPrev3 = hallRaw3;
+  // Stable normalized 0/1 hall states.
+  const int hallValue1 = hallRaw1;
+  const int hallValue2 = hallRaw2;
+  const int hallValue3 = hallRaw3;
 
   if (fsrFiltered == 0.0f) {
     fsrFiltered = (float)fsrRaw;
@@ -187,3 +180,4 @@ void loop() {
 // Serial.print(buf);
   delay(20);  // ~50 Hz
 }
+
