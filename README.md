@@ -1,4 +1,5 @@
 # GesturePlay
+python3 /Users/patliu/Desktop/Coding/MakeMIT2026/hand_tracking.py --port /dev/cu.usbserial-0001 --camera-index 0
 
 A hand-tracking piano that plays notes based on finger gestures. Built with MediaPipe and OpenCV for MakeMIT 2026.
 
