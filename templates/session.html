@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ session.metadata.performer_id }} - GestureHand</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+        
+        header h1 {
+            font-size: 2rem;
+            margin-bottom: 1.5rem;
+        }
+        
+        header a {
+            background: #667eea;
+            color: white;
+            padding: 0.6rem 1.2rem;
+            border-radius: 6px;
+            text-decoration: none;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+            display: inline-block;
+        }
+        
+        header a:hover {
+            background: #764ba2;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+            margin: 2rem 0;
+        }
+        
+        .stat {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        
+        .stat-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+        
+        .content {
+            background: white;
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+        }
+        
+        .section-title {
+            font-size: 1.3rem;
+            margin: 2rem 0 1rem 0;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .metadata {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 6px;
+            margin-bottom: 2rem;
+        }
+        
+        .metadata-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 0.5rem 0;
+        }
+        
+        .metadata-label {
+            font-weight: 600;
+            color: #666;
+        }
+        
+        .event-timeline {
+            margin-top: 1.5rem;
+        }
+        
+        .event {
+            border-left: 3px solid #667eea;
+            padding-left: 1.5rem;
+            margin-bottom: 1rem;
+            position: relative;
+        }
+        
+        .event::before {
+            content: '';
+            position: absolute;
+            left: -7px;
+            top: 0;
+            width: 10px;
+            height: 10px;
+            background: #667eea;
+            border-radius: 50%;
+        }
+        
+        .event-time {
+            font-size: 0.85rem;
+            color: #999;
+            font-family: monospace;
+        }
+        
+        .event-type {
+            font-weight: 600;
+            color: #333;
+            margin: 0.25rem 0;
+        }
+        
+        .event-data {
+            font-size: 0.9rem;
+            color: #666;
+            background: #f8f9fa;
+            padding: 0.5rem;
+            border-radius: 4px;
+            margin-top: 0.25rem;
+            word-break: break-all;
+        }
+        
+        .no-events {
+            text-align: center;
+            color: #999;
+            padding: 2rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎵 {{ session.metadata.performer_id }}</h1>
+            <a href="/">← Back to Sessions</a>
+        </header>
+        
+        <div class="stats-grid">
+            <div class="stat">
+                <div class="stat-value">{{ session.event_count }}</div>
+                <div class="stat-label">Events Captured</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">
+                    {% set start = session.started_at | replace('T', ' ') %}
+                    {% set end = session.ended_at | replace('T', ' ') %}
+                    {% if session.ended_at %}
+                        ~{{ (session.event_count / 60) | int }}s
+                    {% else %}
+                        Live
+                    {% endif %}
+                </div>
+                <div class="stat-label">Duration</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{{ session.metadata.get('camera_index', 'N/A') }}</div>
+                <div class="stat-label">Camera Index</div>
+            </div>
+        </div>
+        
+        <div class="content">
+            <div class="section-title">📊 Session Info</div>
+            <div class="metadata">
+                <div class="metadata-row">
+                    <span class="metadata-label">Session ID:</span>
+                    <span style="font-family: monospace;">{{ session.session_id }}</span>
+                </div>
+                <div class="metadata-row">
+                    <span class="metadata-label">Started:</span>
+                    <span>{{ session.started_at }}</span>
+                </div>
+                <div class="metadata-row">
+                    <span class="metadata-label">Ended:</span>
+                    <span>
+                        {% if session.ended_at %}
+                            {{ session.ended_at }}
+                        {% else %}
+                            (Ongoing)
+                        {% endif %}
+                    </span>
+                </div>
+                <div class="metadata-row">
+                    <span class="metadata-label">Performer:</span>
+                    <span>{{ session.metadata.performer_id }}</span>
+                </div>
+                <div class="metadata-row">
+                    <span class="metadata-label">Chord Source:</span>
+                    <span>{{ session.metadata.get('chord_source', 'unknown') }}</span>
+                </div>
+            </div>
+            
+            <div class="section-title">📈 Event Timeline</div>
+            <div class="event-timeline">
+                {% if session.events %}
+                    {% for event in session.events[:50] %}
+                    <div class="event">
+                        <div class="event-time">{{ event.timestamp }}</div>
+                        <div class="event-type">{{ event.type }}</div>
+                        {% if event | length > 2 %}
+                        <div class="event-data">
+                            {% for key, value in event.items() %}
+                                {% if key not in ['timestamp', 'type'] %}
+                                    <strong>{{ key }}:</strong> {{ value }}<br>
+                                {% endif %}
+                            {% endfor %}
+                        </div>
+                        {% endif %}
+                    </div>
+                    {% endfor %}
+                    
+                    {% if session.events | length > 50 %}
+                    <div style="text-align: center; color: #999; margin-top: 2rem;">
+                        ... and {{ session.events | length - 50 }} more events
+                    </div>
+                    {% endif %}
+                {% else %}
+                <div class="no-events">No events recorded</div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</body>
+</html>

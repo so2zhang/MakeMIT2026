@@ -6,6 +6,7 @@
 - Fuses both to trigger notes and CC controls.
 - Plays evolving Markov chord pad on MIDI channel 2.
 - Thumb sensor ADC value is also mapped continuously to CC27.
+- Logs all events to local JSON session file.
 """
 
 import argparse
@@ -24,6 +25,7 @@ import mido.backends.rtmidi
 import numpy as np
 import serial
 from chord_library import ChordSequencePlayer
+from local_session_logger import LocalSessionLogger
 
 if not hasattr(serial, "Serial"):
     raise SystemExit(
@@ -514,6 +516,8 @@ def parse_args():
                         help="Name of the virtual MIDI output port to create (default: 'GestureHand MIDI')")
     parser.add_argument("--list-midi", action="store_true",
                         help="List available MIDI output ports and exit")
+    parser.add_argument("--performer-id", default="guest",
+                        help="Performer name for session logging (default: 'guest')")
     parser.add_argument("--camera-index", type=int, default=0, help="OpenCV camera index")
     parser.add_argument("--list-cameras", action="store_true", help="Probe and list available camera indexes")
     parser.add_argument("--key-root", type=int, default=60)
@@ -742,6 +746,22 @@ def main():
         raise SystemExit("Missing --port. Example: --port /dev/cu.usbserial-0001")
 
     midi_out = MidiOutput(args.midi_port)
+    
+    # Initialize local session logger
+    session_logger = LocalSessionLogger()
+    session_logger.log_metadata(
+        performer_id=args.performer_id,
+        camera_index=args.camera_index,
+        serial_port=args.port,
+        chord_source=args.chord_source
+    )
+    
+    # Log session start
+    session_logger.log_event("session_started", data={
+        "camera_index": args.camera_index,
+        "serial_port": args.port,
+        "chord_source": args.chord_source,
+    })
 
     # Allow CLI overrides for thumb CC config
     thumb_cc_num   = args.thumb_cc
@@ -1011,6 +1031,17 @@ def main():
             _gy = 0.0 if abs(_gy) < GYRO_DEAD else _gy
             _gz = 0.0 if abs(_gz) < GYRO_DEAD else _gz
 
+            # Log telemetry data for live dashboard (every 10 frames ~= 5 per second)
+            if frame_counter % 10 == 0:
+                session_logger.log_event("imu_data", data={
+                    "accel_x": round(_ax, 3),
+                    "accel_y": round(_ay, 3),
+                    "accel_z": round(_az, 3),
+                    "gyro_x": round(_gx, 3),
+                    "gyro_y": round(_gy, 3),
+                    "gyro_z": round(_gz, 3),
+                })
+
             if flex_fresh:
                 ahrs.update(_gx, _gy, _gz, _ax, _ay, _az)
 
@@ -1157,6 +1188,11 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    
+    # Save session to disk
+    filepath = session_logger.save()
+    session_logger.summary()
+    print(f"\n💾 View your session: python3 local_session_logger.py {filepath}")
 
 
 if __name__ == "__main__":

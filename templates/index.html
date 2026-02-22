@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GestureHand Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 2rem;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            color: white;
+            margin-bottom: 3rem;
+            text-align: center;
+        }
+        
+        header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            font-weight: 700;
+        }
+        
+        header p {
+            font-size: 1rem;
+            opacity: 0.9;
+        }
+        
+        .sessions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+            gap: 1.5rem;
+        }
+        
+        .session-card {
+            background: white;
+            border-radius: 12px;
+            padding: 1.5rem;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, box-shadow 0.2s;
+            cursor: pointer;
+            text-decoration: none;
+            color: inherit;
+            display: block;
+        }
+        
+        .session-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 15px 40px rgba(0, 0, 0, 0.3);
+        }
+        
+        .session-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 1rem;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 1rem;
+        }
+        
+        .performer-name {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .event-badge {
+            background: #667eea;
+            color: white;
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+        }
+        
+        .session-meta {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+            color: #666;
+        }
+        
+        .meta-item {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .label {
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .empty-state {
+            text-align: center;
+            color: white;
+            padding: 3rem;
+        }
+        
+        .empty-state h2 {
+            font-size: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        
+        .empty-state p {
+            opacity: 0.9;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎵 GestureHand</h1>
+            <p>Performance Sessions Dashboard</p>
+        </header>
+        
+        {% if sessions %}
+        <div class="sessions-grid">
+            {% for session in sessions %}
+            <a href="/session/{{ session.file }}" class="session-card">
+                <div class="session-card-header">
+                    <div class="performer-name">{{ session.performer }}</div>
+                    <div class="event-badge">{{ session.event_count }} events</div>
+                </div>
+                <div class="session-meta">
+                    <div class="meta-item">
+                        <span class="label">Session ID:</span>
+                        <span style="font-family: monospace;">{{ session.id[:12] }}...</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="label">Started:</span>
+                        <span>{{ session.started[-19:-10] }}</span>
+                    </div>
+                    <div class="meta-item">
+                        <span class="label">Duration:</span>
+                        <span>
+                            {% if session.ended %}
+                                {% set start = session.started | replace('T', ' ') %}
+                                {% set end = session.ended | replace('T', ' ') %}
+                                ~{{ (session.event_count / 60) | int }}s
+                            {% else %}
+                                Ongoing...
+                            {% endif %}
+                        </span>
+                    </div>
+                </div>
+            </a>
+            {% endfor %}
+        </div>
+        {% else %}
+        <div class="empty-state">
+            <h2>🎪 No sessions yet</h2>
+            <p>Run <code style="background: rgba(0,0,0,0.2); padding: 0.2rem 0.4rem; border-radius: 4px;">hand_tracking.py</code> to create your first session.</p>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>

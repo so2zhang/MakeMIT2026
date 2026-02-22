@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html class="dark" lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GestureHand Live Dashboard</title>
+    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
+    
+    <script id="tailwind-config">
+        tailwind.config = {
+            darkMode: "class",
+            theme: {
+                extend: {
+                    colors: {
+                        "primary": "#258cf4",
+                        "background-light": "#f5f7f8",
+                        "background-dark": "#0a0c0e",
+                        "danger": "#ef4444",
+                    },
+                    fontFamily: {
+                        "display": ["Space Grotesk", "monospace"]
+                    },
+                    borderRadius: {
+                        "DEFAULT": "0.25rem",
+                        "lg": "0.5rem",
+                        "xl": "0.75rem",
+                        "full": "9999px"
+                    },
+                },
+            },
+        }
+    </script>
+    
+    <style>
+        @keyframes pulse-red {
+            0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+            100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        .pulse-dot {
+            animation: pulse-red 2s infinite;
+        }
+        
+        body {
+            min-height: max(884px, 100dvh);
+        }
+        
+        /* Smooth chart animations */
+        .chart-line {
+            transition: all 0.3s ease-out;
+        }
+    </style>
+</head>
+<body class="bg-background-light dark:bg-background-dark text-slate-900 dark:text-slate-100 font-display min-h-screen flex flex-col">
+
+<!-- Top Bar -->
+<header class="sticky top-0 z-50 border-b border-primary/10 bg-background-light/80 dark:bg-background-dark/80 backdrop-blur-md px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2">
+        <span class="material-symbols-outlined text-primary">back_hand</span>
+        <h1 class="text-xl font-bold tracking-tight">GestureHand</h1>
+    </div>
+    <div id="status-badge" class="flex items-center gap-3 bg-primary/5 dark:bg-primary/10 px-3 py-1.5 rounded-full border border-primary/20">
+        <div class="w-2 h-2 rounded-full bg-danger pulse-dot"></div>
+        <span class="text-xs font-bold tracking-widest uppercase">Live</span>
+    </div>
+</header>
+
+<main class="flex-1 overflow-y-auto p-4 space-y-6">
+    
+    <!-- Status Message -->
+    <div id="status-message" class="bg-slate-100 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 p-4 rounded-lg text-center">
+        <p class="text-sm text-slate-600 dark:text-slate-400">Waiting for session data...</p>
+    </div>
+    
+    <!-- Hero Section: Telemetry Stream -->
+    <section class="space-y-4">
+        <div class="flex items-end justify-between px-1">
+            <h2 class="text-sm font-medium text-slate-500 dark:text-primary/60 tracking-widest uppercase">Telemetry Stream</h2>
+            <span class="text-[10px] font-mono opacity-50">60Hz / 12ms Latency</span>
+        </div>
+        
+        <div class="grid grid-cols-1 gap-4">
+            
+            <!-- X-Axis Chart -->
+            <div class="bg-primary/5 dark:bg-slate-900/40 border border-primary/10 p-4 rounded-xl">
+                <div class="flex justify-between items-start mb-2">
+                    <span class="text-xs font-mono text-primary">Axis_X</span>
+                    <span class="text-lg font-mono font-bold">
+                        <span id="accel-x">0.00</span><span class="text-[10px] opacity-50 ml-1">m/s²</span>
+                    </span>
+                </div>
+                <div class="h-16 w-full">
+                    <svg id="chart-x" class="w-full h-full" preserveAspectRatio="none" viewBox="0 0 400 60">
+                        <defs>
+                            <linearGradient id="grad-x" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#258cf4;stop-opacity:0.3" />
+                                <stop offset="100%" style="stop-color:#258cf4;stop-opacity:0" />
+                            </linearGradient>
+                        </defs>
+                        <path id="path-x" class="text-primary chart-line" d="M0 30 L400 30" fill="none" stroke="currentColor" stroke-width="2"></path>
+                        <path id="area-x" d="M0 30 L400 30 L400 60 L0 60 Z" fill="url(#grad-x)"></path>
+                    </svg>
+                </div>
+            </div>
+            
+            <!-- Y-Axis Chart -->
+            <div class="bg-primary/5 dark:bg-slate-900/40 border border-primary/10 p-4 rounded-xl">
+                <div class="flex justify-between items-start mb-2">
+                    <span class="text-xs font-mono text-primary">Axis_Y</span>
+                    <span class="text-lg font-mono font-bold">
+                        <span id="accel-y">0.00</span><span class="text-[10px] opacity-50 ml-1">m/s²</span>
+                    </span>
+                </div>
+                <div class="h-16 w-full">
+                    <svg id="chart-y" class="w-full h-full" preserveAspectRatio="none" viewBox="0 0 400 60">
+                        <defs>
+                            <linearGradient id="grad-y" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#258cf4;stop-opacity:0.3" />
+                                <stop offset="100%" style="stop-color:#258cf4;stop-opacity:0" />
+                            </linearGradient>
+                        </defs>
+                        <path id="path-y" class="text-primary chart-line" d="M0 30 L400 30" fill="none" stroke="currentColor" stroke-width="2"></path>
+                        <path id="area-y" d="M0 30 L400 30 L400 60 L0 60 Z" fill="url(#grad-y)"></path>
+                    </svg>
+                </div>
+            </div>
+            
+            <!-- Z-Axis Chart -->
+            <div class="bg-primary/5 dark:bg-slate-900/40 border border-primary/10 p-4 rounded-xl">
+                <div class="flex justify-between items-start mb-2">
+                    <span class="text-xs font-mono text-primary">Axis_Z</span>
+                    <span class="text-lg font-mono font-bold">
+                        <span id="accel-z">0.00</span><span class="text-[10px] opacity-50 ml-1">m/s²</span>
+                    </span>
+                </div>
+                <div class="h-16 w-full">
+                    <svg id="chart-z" class="w-full h-full" preserveAspectRatio="none" viewBox="0 0 400 60">
+                        <defs>
+                            <linearGradient id="grad-z" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#258cf4;stop-opacity:0.3" />
+                                <stop offset="100%" style="stop-color:#258cf4;stop-opacity:0" />
+                            </linearGradient>
+                        </defs>
+                        <path id="path-z" class="text-primary chart-line" d="M0 30 L400 30" fill="none" stroke="currentColor" stroke-width="2"></path>
+                        <path id="area-z" d="M0 30 L400 30 L400 60 L0 60 Z" fill="url(#grad-z)"></path>
+                    </svg>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Middle Section: Fingerprint -->
+    <section class="space-y-4 py-4">
+        <div class="bg-background-light dark:bg-slate-900 border-2 border-primary/20 rounded-2xl p-6 text-center shadow-2xl shadow-primary/5">
+            <p class="text-[10px] font-bold tracking-[0.2em] text-slate-500 mb-2 uppercase">Session Fingerprint Hash</p>
+            <h3 id="fingerprint" class="text-3xl font-mono font-bold tracking-tight text-primary truncate">0x0000...0000</h3>
+            <p id="session-id" class="text-[10px] text-slate-500 mt-2 font-mono">Session ID: --:--:--</p>
+            
+            <div class="mt-4 flex flex-wrap justify-center gap-2">
+                <div class="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-lg">
+                    <span class="material-symbols-outlined text-sm">cloud_sync</span>
+                    <span class="text-[11px] font-medium">Streaming to Vultr NJ-1</span>
+                </div>
+                <div class="flex items-center gap-2 bg-green-500/10 border border-green-500/20 px-3 py-1 rounded-lg text-green-500">
+                    <span class="material-symbols-outlined text-sm">encrypted</span>
+                    <span class="text-[11px] font-medium">AES-256</span>
+                </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Controls -->
+    <section class="pt-2">
+        <a href="/" class="w-full py-4 border-2 border-primary/40 text-primary hover:bg-primary/10 font-bold rounded-xl transition-all flex items-center justify-center gap-2 group">
+            <span class="material-symbols-outlined transition-transform group-active:scale-90">home</span>
+            <span>BACK TO SESSIONS</span>
+        </a>
+    </section>
+</main>
+
+<!-- Bottom Stats Bar -->
+<footer class="mt-auto border-t border-primary/10 bg-slate-100 dark:bg-slate-900/80 px-4 py-3 grid grid-cols-2 gap-4">
+    <div class="space-y-0.5">
+        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Events Ingested</p>
+        <p id="event-count" class="font-mono text-sm">0</p>
+    </div>
+    <div class="space-y-0.5 text-right border-l border-primary/10 pl-4">
+        <p class="text-[10px] text-slate-500 uppercase font-bold tracking-wider">Session Uptime</p>
+        <p id="uptime" class="font-mono text-sm">00:00:00</p>
+    </div>
+</footer>
+
+<!-- Navigation -->
+<nav class="flex border-t border-primary/10 bg-background-light dark:bg-background-dark pb-6 pt-2">
+    <a class="flex flex-1 flex-col items-center gap-1 text-primary" href="/api/sessions/list">
+        <span class="material-symbols-outlined text-[24px]">analytics</span>
+    </a>
+    <a class="flex flex-1 flex-col items-center gap-1 text-slate-400" href="/">
+        <span class="material-symbols-outlined text-[24px]">home</span>
+    </a>
+    <a class="flex flex-1 flex-col items-center gap-1 text-slate-400" href="#" onclick="location.reload()">
+        <span class="material-symbols-outlined text-[24px]">refresh</span>
+    </a>
+</nav>
+
+<script>
+    // Data scaling for charts
+    const MAX_ACCEL = 2.0; // Max acceleration for scaling (m/s²)
+    const CHART_HEIGHT = 60;
+    const CHART_WIDTH = 400;
+    
+    // Normalize acceleration value to chart coordinates
+    function normalizeValue(value) {
+        // Clamp between -MAX_ACCEL and MAX_ACCEL
+        value = Math.max(-MAX_ACCEL, Math.min(MAX_ACCEL, value));
+        // Map to chart height (0-60), where middle is 30
+        return (CHART_HEIGHT / 2) - (value / MAX_ACCEL) * (CHART_HEIGHT / 2);
+    }
+    
+    // Generate SVG path from data array
+    function generatePath(data) {
+        if (data.length === 0) return `M0 ${CHART_HEIGHT / 2}`;
+        
+        const step = CHART_WIDTH / (data.length - 1 || 1);
+        const points = data.map((val, i) => {
+            const x = i * step;
+            const y = normalizeValue(val);
+            return `${i === 0 ? 'M' : 'L'} ${x} ${y}`;
+        }).join(' ');
+        
+        return points;
+    }
+    
+    // Update chart
+    function updateChart(chartId, pathId, areaId, data) {
+        const path = document.getElementById(pathId);
+        const area = document.getElementById(areaId);
+        
+        if (data.length > 0) {
+            const pathStr = generatePath(data);
+            const lastY = normalizeValue(data[data.length - 1]);
+            const firstY = normalizeValue(data[0]);
+            
+            path.setAttribute('d', pathStr);
+            area.setAttribute('d', `${pathStr} L ${CHART_WIDTH} ${CHART_HEIGHT} L 0 ${CHART_HEIGHT} Z`);
+        }
+    }
+    
+    // Fetch and update telemetry
+    async function updateTelemetry() {
+        try {
+            const response = await fetch('/api/session/current');
+            const data = await response.json();
+            
+            if (data.status === 'waiting') {
+                document.getElementById('status-message').innerHTML = 
+                    '<p class="text-sm text-slate-600 dark:text-slate-400">⏳ No active session. Run hand_tracking.py to start capturing data.</p>';
+                document.getElementById('status-badge').innerHTML = 
+                    '<div class="w-2 h-2 rounded-full bg-slate-400"></div><span class="text-xs font-bold tracking-widest uppercase">Waiting</span>';
+                return;
+            }
+            
+            // Hide status message on active session
+            document.getElementById('status-message').style.display = 'none';
+            
+            // Update fingerprint and session info
+            document.getElementById('fingerprint').textContent = data.fingerprint;
+            document.getElementById('session-id').textContent = `Session ID: ${data.session_id}`;
+            
+            // Update telemetry values
+            document.getElementById('accel-x').textContent = data.telemetry.x.current.toFixed(2);
+            document.getElementById('accel-y').textContent = data.telemetry.y.current.toFixed(2);
+            document.getElementById('accel-z').textContent = data.telemetry.z.current.toFixed(2);
+            
+            // Update charts
+            updateChart('chart-x', 'path-x', 'area-x', data.telemetry.x.history);
+            updateChart('chart-y', 'path-y', 'area-y', data.telemetry.y.history);
+            updateChart('chart-z', 'path-z', 'area-z', data.telemetry.z.history);
+            
+            // Update stats
+            document.getElementById('event-count').textContent = 
+                data.stats.events_ingested.toLocaleString();
+            document.getElementById('uptime').textContent = data.stats.uptime;
+            
+        } catch (error) {
+            console.error('Error fetching telemetry:', error);
+        }
+    }
+    
+    // Poll for updates every 500ms
+    setInterval(updateTelemetry, 500);
+    
+    // Initial update
+    updateTelemetry();
+</script>
+
+</body>
+</html>
