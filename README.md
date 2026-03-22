@@ -1,4 +1,4 @@
-# GesturePlay
+# Cadence
 
 A hand-tracking piano that plays notes based on finger gestures. Built with MediaPipe and OpenCV for MakeMIT 2026.
 
